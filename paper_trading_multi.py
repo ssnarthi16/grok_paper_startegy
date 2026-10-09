@@ -1593,7 +1593,6 @@ def strategies_home():
 
     with st.sidebar:
         st.write(f"Connected: **{st.session_state.get('client_id', '-')}**")
-        st.caption(f"Save path: `{user_strategies_root(uid)}`")
         if st.button("Logout (Angel only)"):
             # Stop engines + clear Angel session only.
             # Access (email) stays — strategies on disk stay. Re-login Angel → same folders.
@@ -1616,26 +1615,9 @@ def strategies_home():
             _set_nav("create")
             st.rerun()
 
-    root = user_strategies_root(uid)
     strategies = list_strategies(uid)
     if not strategies:
         st.info("No strategies yet. Sidebar-la **+ New strategy / file** click pannunga.")
-        st.caption(f"Save location: `{root}`")
-        # Show raw disk contents so we can see if files exist but failed to load
-        try:
-            raw = []
-            if os.path.isdir(root):
-                for fd in sorted(os.listdir(root)):
-                    fp = os.path.join(root, fd)
-                    if os.path.isdir(fp):
-                        kids = [x for x in os.listdir(fp) if os.path.isdir(os.path.join(fp, x))]
-                        raw.append(f"{fd}/ → {kids or '(empty)'}")
-            if raw:
-                st.warning("Folders on disk but no valid config.json found:\n" + "\n".join(raw))
-            else:
-                st.caption("Disk empty — create first strategy. Streamlit Cloud app restart-la local files wipe aagalam; create pannina odane Open panni check pannunga.")
-        except Exception as ex:
-            st.caption(f"Could not list disk: {ex}")
         return
 
     for folder, files in strategies.items():
@@ -1676,7 +1658,6 @@ def create_strategy_page():
         st.rerun()
 
     st.title("New strategy / file")
-    st.caption(f"Will save under: `{user_strategies_root(uid)}`")
 
     if step == 1:
         st.subheader("Step 1 · Folder & File name")
@@ -1815,7 +1796,7 @@ def create_strategy_page():
             for k in ("create_step", "create_folder", "create_file"):
                 st.session_state.pop(k, None)
             _set_nav("file", sf, sn)
-            st.success(f"Saved at `{path}`")
+            st.success("Strategy saved.")
             st.rerun()
 
 
@@ -1841,7 +1822,7 @@ def file_dashboard():
     folder, file_name = active["folder"], active["file"]
     cfg_data = load_strategy_config(path)
     if not cfg_data:
-        st.error(f"Config not found at `{path}`.")
+        st.error("Config not found for this strategy.")
         if st.button("Back"):
             _set_nav("home")
             st.rerun()
