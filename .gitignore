@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+# Live paper trading state
+live_state.json
+
+# Angel One script master cache
+scrip_master_cache.pkl
+
+# Logs
+logs/
+*.log
+
+# Secrets
+.env
+.streamlit/secrets.toml
