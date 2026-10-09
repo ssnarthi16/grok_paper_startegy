@@ -43,7 +43,11 @@ TIMEFRAMES = {
 }
 
 OWNER_ID = "owner"
-STRATEGIES_ROOT = "strategies"
+# Absolute data root so saves survive cwd changes on Streamlit Cloud.
+# Override with env DATA_DIR if needed. App reboot on free Cloud can still wipe disk.
+_DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(os.path.expanduser("~"), "paper_trading_data")
+STRATEGIES_ROOT = os.path.join(_DATA_DIR, "strategies")
+os.makedirs(STRATEGIES_ROOT, exist_ok=True)
 
 
 # ============================== CONFIG ==============================
@@ -370,9 +374,13 @@ def _safe_name(name: str) -> str:
 
 
 def user_strategies_root(uid: str) -> str:
+    """Per-user folder under absolute DATA_DIR (always absolute path)."""
     if uid == OWNER_ID:
-        return STRATEGIES_ROOT
-    return os.path.join("users", uid, STRATEGIES_ROOT)
+        root = STRATEGIES_ROOT
+    else:
+        root = os.path.join(_DATA_DIR, "users", uid, "strategies")
+    os.makedirs(root, exist_ok=True)
+    return root
 
 
 def strategy_dir(uid: str, folder: str, file: str) -> str:
@@ -389,22 +397,31 @@ def list_strategies(uid: str) -> dict:
         return out
     for folder in sorted(os.listdir(root)):
         fp = os.path.join(root, folder)
-        if not os.path.isdir(fp):
+        if not os.path.isdir(fp) or folder.startswith("."):
             continue
         files = []
         for fname in sorted(os.listdir(fp)):
             fpath = os.path.join(fp, fname)
-            if not os.path.isdir(fpath):
+            if not os.path.isdir(fpath) or fname.startswith("."):
                 continue
             cfg_path = os.path.join(fpath, "config.json")
+            if not os.path.exists(cfg_path):
+                continue
             meta = {"file": fname, "path": fpath, "folder": folder}
-            if os.path.exists(cfg_path):
-                try:
-                    meta.update(json.load(open(cfg_path)))
-                except Exception:
-                    pass
+            try:
+                meta.update(json.load(open(cfg_path)))
+            except Exception:
+                pass
             eng = _get_engine_by_path(uid, fpath)
             meta["running"] = eng.running if eng else False
+            # also check run_config if engine not in memory yet
+            if not meta["running"]:
+                rf = os.path.join(fpath, "run_config.json")
+                if os.path.exists(rf):
+                    try:
+                        meta["running"] = bool(json.load(open(rf)).get("running"))
+                    except Exception:
+                        pass
             files.append(meta)
         if files:
             out[folder] = files
@@ -419,8 +436,12 @@ def save_strategy_config(uid: str, folder: str, file: str, data: dict) -> str:
     data["folder"] = _safe_name(folder)
     data["file"] = _safe_name(file)
     data["updated"] = str(now_ist())
-    with open(os.path.join(path, "config.json"), "w") as f:
+    cfg_path = os.path.join(path, "config.json")
+    with open(cfg_path, "w") as f:
         json.dump(data, f, indent=1, default=str)
+    # verify write
+    if not os.path.exists(cfg_path):
+        raise RuntimeError(f"Failed to save config at {cfg_path}")
     return path
 
 
@@ -442,7 +463,6 @@ def delete_strategy(uid: str, folder: str, file: str):
     import shutil
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
-    # remove empty folder
     fdir = os.path.dirname(path)
     if os.path.isdir(fdir) and not os.listdir(fdir):
         shutil.rmtree(fdir, ignore_errors=True)
@@ -1098,6 +1118,43 @@ def _engine_registry():
     return {"lock": threading.Lock(), "map": {}}
 
 
+@st.cache_resource
+def _login_cache():
+    """Server-memory Angel sessions per uid.
+    Survives page refresh / laptop sleep while the Streamlit process is alive.
+    Cleared only on explicit Logout or full app restart."""
+    return {"lock": threading.Lock(), "map": {}}
+
+
+def save_login(uid, smart, creds, client_id):
+    if not uid or smart is None:
+        return
+    cache = _login_cache()
+    with cache["lock"]:
+        cache["map"][uid] = {
+            "smart": smart,
+            "creds": creds,
+            "client_id": client_id or "",
+            "login_time": time.time(),
+        }
+
+
+def load_login(uid):
+    if not uid:
+        return None
+    cache = _login_cache()
+    with cache["lock"]:
+        return cache["map"].get(uid)
+
+
+def clear_login(uid):
+    if not uid:
+        return
+    cache = _login_cache()
+    with cache["lock"]:
+        cache["map"].pop(uid, None)
+
+
 def get_strategy_engine(uid, strategy_path):
     """One Engine per (user, strategy folder/file)."""
     reg = _engine_registry()
@@ -1500,6 +1557,7 @@ def login_page():
     uid = current_uid()
     creds = (api_key.strip(), client_id.strip(), mpin.strip(), totp_secret.strip())
     cid = client_id.strip().upper()
+    save_login(uid, smart, creds, cid)          # survives refresh (server memory)
     share_login_to_engines(uid, smart, creds, cid)
     st.session_state.smart = smart
     st.session_state.client_id = cid
@@ -1507,6 +1565,23 @@ def login_page():
     st.session_state.pop("no_autologin", None)
     autoresume_all(uid, smart, creds, cid)
     st.rerun()
+
+
+def _set_nav(page="home", folder="", file=""):
+    """Keep page in query params so refresh / new tab with same URL stays on page.
+       Email (access) is already in ?e= — that alone prevents access re-request."""
+    st.session_state["page"] = page
+    qp = dict(st.query_params)
+    if st.session_state.get("access_email"):
+        qp["e"] = st.session_state["access_email"]
+    qp["p"] = page
+    if page == "file" and folder and file:
+        qp["folder"] = folder
+        qp["file"] = file
+    else:
+        qp.pop("folder", None)
+        qp.pop("file", None)
+    st.query_params.from_dict(qp)
 
 
 def strategies_home():
@@ -1517,29 +1592,50 @@ def strategies_home():
     st.caption("Folder → File. Each file has its own Exchange, Stocks, Capital, Timeframe, Start / Stop.")
 
     with st.sidebar:
-        st.write(f"Connected: **{st.session_state.client_id}**")
-        if st.button("Logout"):
-            # stop all engines for this user
+        st.write(f"Connected: **{st.session_state.get('client_id', '-')}**")
+        st.caption(f"Save path: `{user_strategies_root(uid)}`")
+        if st.button("Logout (Angel only)"):
+            # Stop engines + clear Angel session only.
+            # Access (email) stays — strategies on disk stay. Re-login Angel → same folders.
             reg = _engine_registry()
             with reg["lock"]:
                 for k, eng in list(reg["map"].items()):
                     if k.startswith(f"{uid}::"):
                         eng.stop()
                         eng.smart = eng.creds = None
+            clear_login(uid)                     # next visit must enter API key again
             for k in ("smart", "client_id", "creds", "active_strategy"):
                 st.session_state.pop(k, None)
             st.session_state["no_autologin"] = True
+            # do NOT clear access_granted / access_email
             st.rerun()
         if st.button("+ New strategy / file", type="primary", use_container_width=True):
-            st.session_state["page"] = "create"
             st.session_state.pop("create_step", None)
             st.session_state.pop("create_folder", None)
             st.session_state.pop("create_file", None)
+            _set_nav("create")
             st.rerun()
 
+    root = user_strategies_root(uid)
     strategies = list_strategies(uid)
     if not strategies:
-        st.info("No strategies yet. Click **+ New strategy / file** in the sidebar.")
+        st.info("No strategies yet. Sidebar-la **+ New strategy / file** click pannunga.")
+        st.caption(f"Save location: `{root}`")
+        # Show raw disk contents so we can see if files exist but failed to load
+        try:
+            raw = []
+            if os.path.isdir(root):
+                for fd in sorted(os.listdir(root)):
+                    fp = os.path.join(root, fd)
+                    if os.path.isdir(fp):
+                        kids = [x for x in os.listdir(fp) if os.path.isdir(os.path.join(fp, x))]
+                        raw.append(f"{fd}/ → {kids or '(empty)'}")
+            if raw:
+                st.warning("Folders on disk but no valid config.json found:\n" + "\n".join(raw))
+            else:
+                st.caption("Disk empty — create first strategy. Streamlit Cloud app restart-la local files wipe aagalam; create pannina odane Open panni check pannunga.")
+        except Exception as ex:
+            st.caption(f"Could not list disk: {ex}")
         return
 
     for folder, files in strategies.items():
@@ -1558,7 +1654,7 @@ def strategies_home():
                     st.session_state["active_strategy"] = {
                         "folder": folder, "file": meta["file"], "path": meta["path"],
                     }
-                    st.session_state["page"] = "file"
+                    _set_nav("file", folder, meta["file"])
                     st.rerun()
             with col3:
                 if st.button("Delete", key=f"del_{folder}_{meta['file']}", use_container_width=True):
@@ -1576,15 +1672,20 @@ def create_strategy_page():
     step = st.session_state.get("create_step", 1)
 
     if st.button("← Back to Strategies"):
-        st.session_state["page"] = "home"
+        _set_nav("home")
         st.rerun()
 
     st.title("New strategy / file")
+    st.caption(f"Will save under: `{user_strategies_root(uid)}`")
 
     if step == 1:
         st.subheader("Step 1 · Folder & File name")
         existing = list(list_strategies(uid).keys())
-        folder_mode = st.radio("Folder", ["Existing folder", "New folder"], horizontal=True)
+        folder_mode = st.radio(
+            "Folder",
+            ["New folder", "Existing folder"] if not existing else ["Existing folder", "New folder"],
+            horizontal=True,
+        )
         if folder_mode == "Existing folder" and existing:
             folder = st.selectbox("Folder", existing)
         else:
@@ -1707,13 +1808,14 @@ def create_strategy_page():
                 "target_pct": float(target_pct),
             }
             path = save_strategy_config(uid, folder, file_name, data)
+            sf, sn = _safe_name(folder), _safe_name(file_name)
             st.session_state["active_strategy"] = {
-                "folder": _safe_name(folder), "file": _safe_name(file_name), "path": path,
+                "folder": sf, "file": sn, "path": path,
             }
-            st.session_state["page"] = "file"
             for k in ("create_step", "create_folder", "create_file"):
                 st.session_state.pop(k, None)
-            st.success("Saved. Opening file page...")
+            _set_nav("file", sf, sn)
+            st.success(f"Saved at `{path}`")
             st.rerun()
 
 
@@ -1721,8 +1823,17 @@ def file_dashboard():
     """One strategy file: Start/Stop + live tables. Edit settings only when STOPPED."""
     uid = current_uid()
     active = st.session_state.get("active_strategy")
+    # restore from URL if session lost (refresh / other tab)
     if not active:
-        st.session_state["page"] = "home"
+        qf = str(st.query_params.get("folder", "")).strip()
+        qn = str(st.query_params.get("file", "")).strip()
+        if qf and qn:
+            path = strategy_dir(uid, qf, qn)
+            if os.path.exists(os.path.join(path, "config.json")):
+                active = {"folder": _safe_name(qf), "file": _safe_name(qn), "path": path}
+                st.session_state["active_strategy"] = active
+    if not active:
+        _set_nav("home")
         st.rerun()
         return
 
@@ -1730,14 +1841,13 @@ def file_dashboard():
     folder, file_name = active["folder"], active["file"]
     cfg_data = load_strategy_config(path)
     if not cfg_data:
-        st.error("Config not found.")
+        st.error(f"Config not found at `{path}`.")
         if st.button("Back"):
-            st.session_state["page"] = "home"
+            _set_nav("home")
             st.rerun()
         return
 
     engine = get_strategy_engine(uid, path)
-    # ensure login is on this engine
     if st.session_state.get("smart") and engine.smart is None:
         engine.set_login(
             st.session_state.smart,
@@ -1747,7 +1857,8 @@ def file_dashboard():
 
     no_dim()
     if st.button("← Back to Strategies"):
-        st.session_state["page"] = "home"
+        st.session_state.pop("active_strategy", None)
+        _set_nav("home")
         st.rerun()
 
     st.title(f"{folder} / {file_name}")
@@ -1897,8 +2008,8 @@ def file_dashboard():
 
 
 def main_router():
-    """After login: home / create / file."""
-    page = st.session_state.get("page", "home")
+    """After login: home / create / file. Restore page from URL if session empty."""
+    page = st.session_state.get("page") or str(st.query_params.get("p", "home"))
     if page == "create":
         create_strategy_page()
     elif page == "file":
@@ -1916,27 +2027,70 @@ if not access_gate():
 uid = current_uid()
 _ss = st.session_state
 
-# auto-login for owner
+# Keep email in URL so refresh / laptop wake does not ask access again
+_em = (_ss.get("access_email") or str(st.query_params.get("e", ""))).strip().lower()
+if _em:
+    _ss["access_email"] = _em
+    _ss["access_granted"] = True
+    if st.query_params.get("e") != _em:
+        st.query_params["e"] = _em
+
+# Restore Angel session on refresh — do NOT ask API key again.
+# 1) dedicated login cache  2) fallback: any engine still holding smart
+# Cleared only by Logout button or full app/server restart.
+if "smart" not in _ss and not _ss.get("no_autologin") and uid:
+    cached = load_login(uid)
+    if cached and cached.get("smart") is not None:
+        _ss.smart = cached["smart"]
+        _ss.client_id = cached.get("client_id") or "connected"
+        if cached.get("creds"):
+            _ss.creds = cached["creds"]
+        share_login_to_engines(uid, _ss.smart, _ss.get("creds"), _ss.client_id)
+    else:
+        reg = _engine_registry()
+        with reg["lock"]:
+            for k, eng in reg["map"].items():
+                if k.startswith(f"{uid}::") and eng.smart is not None:
+                    _ss.smart = eng.smart
+                    _ss.client_id = eng.client_id or "connected"
+                    if eng.creds:
+                        _ss.creds = eng.creds
+                    save_login(uid, eng.smart, eng.creds, eng.client_id)
+                    break
+
+# Restore active strategy + page from URL (refresh keeps you on same file page)
+if "active_strategy" not in _ss or not _ss.get("page"):
+    _p = str(st.query_params.get("p", "") or "")
+    _f = str(st.query_params.get("folder", "") or "")
+    _n = str(st.query_params.get("file", "") or "")
+    if _p:
+        _ss["page"] = _p
+    if _p == "file" and _f and _n and uid:
+        _path = strategy_dir(uid, _f, _n)
+        if os.path.exists(os.path.join(_path, "config.json")):
+            _ss["active_strategy"] = {"folder": _f, "file": _n, "path": _path}
+
+# auto-login for owner only (server-saved ANGEL_* secrets)
 if "smart" not in _ss and not _ss.get("no_autologin") and uid == OWNER_ID:
     _creds = env_creds()
     if _creds:
         with st.spinner("Angel One login..."):
             _sm, _err = angel_login(*_creds)
         if _sm is not None:
-            share_login_to_engines(uid, _sm, _creds, _creds[1].strip().upper())
+            cid = _creds[1].strip().upper()
+            save_login(uid, _sm, _creds, cid)
+            share_login_to_engines(uid, _sm, _creds, cid)
             _ss.smart = _sm
-            _ss.client_id = _creds[1].strip().upper()
+            _ss.client_id = cid
             _ss.creds = _creds
-            autoresume_all(uid, _sm, _creds, _creds[1].strip().upper())
+            autoresume_all(uid, _sm, _creds, cid)
         else:
             st.warning(f"Auto login failed: {_err}")
 
 if "smart" not in st.session_state:
     login_page()
 else:
-    # refresh session if old
-    if _ss.get("creds") and time.time() - getattr(
-        get_strategy_engine(uid, strategy_dir(uid, "_", "_")), "login_time", 0
-    ) > 8 * 3600:
-        pass  # per-engine re-login inside Engine._cycle
+    # Push login onto any new engines created after login
+    if uid and _ss.get("smart"):
+        share_login_to_engines(uid, _ss.smart, _ss.get("creds"), _ss.get("client_id", ""))
     main_router()
