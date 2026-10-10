@@ -67,6 +67,7 @@ class Config:
     patterns: tuple = PATTERNS
     position_amount: float = 0.0
     no_limit: bool = False
+    lots_per_position: int = 0                 # MCX / NFO: fixed lots per position (0 = use the amount instead)
 
     @property
     def per_position(self):
@@ -983,8 +984,22 @@ class Engine:
             - sum(p["entry"] * p["qty"] * p.get("mf", 1.0) for p in state["open"])
         )
         one_lot = entry * lot * mf
-        qty = math.floor(min(cfg.per_position, cash) / one_lot) * lot
-        if qty < 1:
+        by_lots = cfg.lots_per_position > 0 and ex in ("MCX", "NFO")
+        if by_lots:                                         # you chose the number of lots
+            n_lots = cfg.lots_per_position
+            qty = n_lots * lot if one_lot * n_lots <= cash else 0
+        else:                                               # amount per position
+            qty = math.floor(min(cfg.per_position, cash) / one_lot) * lot
+        if qty < 1 and by_lots:
+            need = one_lot * cfg.lots_per_position
+            rec["status"] = f"SKIPPED ({cfg.lots_per_position} lot(s) need {need:,.0f})"
+            add_log(
+                state, now,
+                f"SKIPPED {sym}: {cfg.lots_per_position} lot(s) = {cfg.lots_per_position * lot} units need "
+                f"{need:,.0f} margin (price {entry:.2f}{f' x margin {mf * 100:g}%' if mf < 1 else ''}) "
+                f"but free cash is {cash:,.0f}",
+            )
+        elif qty < 1:
             rec["status"] = f"SKIPPED (1 lot needs {one_lot:,.0f})"
             add_log(
                 state, now,
@@ -1438,9 +1453,10 @@ def live_top(engine, exchange, tf_label):
         else f"{exchange} market CLOSED (entry/exit run {hrs} IST, Mon-Fri)"
     )
     upd = f"{snap['last_update']:%H:%M:%S}" if snap["last_update"] is not None else "-"
+    pp_txt = f"{cfg.lots_per_position} lot(s)" if cfg.lots_per_position else f"{cfg.per_position:,.0f}"
     st.write(
         f"**{'RUNNING' if snap['running'] else 'STOPPED'}**  |  {mkt}  |  now {now:%H:%M:%S} IST  |  "
-        f"prices updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {cfg.per_position:,.0f}"
+        f"prices updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {pp_txt}"
     )
     if snap["running"]:
         st.caption(f"Engine: {snap['status']}")
@@ -1638,7 +1654,6 @@ def strategies_home():
     strategies = list_strategies(uid)
     if not strategies:
         st.info("No strategies yet. Sidebar-la **+ New strategy / file** click pannunga.")
-        st.caption(f"Save location: `{root}`")
         # Show raw disk contents so we can see if files exist but failed to load
         try:
             raw = []
@@ -1650,8 +1665,6 @@ def strategies_home():
                         raw.append(f"{fd}/ → {kids or '(empty)'}")
             if raw:
                 st.warning("Folders on disk but no valid config.json found:\n" + "\n".join(raw))
-            else:
-                st.caption("Disk empty — create first strategy. Streamlit Cloud app restart-la local files wipe aagalam; create pannina odane Open panni check pannunga.")
         except Exception as ex:
             st.caption(f"Could not list disk: {ex}")
         return
@@ -1785,13 +1798,22 @@ def create_strategy_page():
     NO_LIMIT = "Select max (no limit)"
     max_pick = st.selectbox("Max open positions", [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50], index=0)
     no_limit = max_pick == NO_LIMIT
-    if no_limit:
-        max_open = 10 ** 6
+    max_open = 10 ** 6 if no_limit else int(max_pick)
+    use_lots, lots_per_pos = False, 0
+    if exchange in ("MCX", "NFO"):
+        use_lots = st.radio("Position size", ["Lots", "Amount"], horizontal=True, key="create_size_mode") == "Lots"
+    if use_lots:
+        lots_val = st.number_input("Lots per position", min_value=1, value=None, step=1, placeholder="Lots", key="create_lots")
+        lots_per_pos = int(lots_val) if lots_val else 0
+        info = ", ".join(f"{it['symbol']}: 1 lot = {it['lot']} units" for it in items[:6])
+        if info:
+            st.caption(info + (" ..." if len(items) > 6 else ""))
+        position_amount = 0.0
+    elif no_limit:
         position_amount = st.number_input(
             "Amount per position", min_value=1.0, value=None, step=1000.0, placeholder="Amount",
         )
     else:
-        max_open = int(max_pick)
         position_amount = st.number_input(
             "Amount per position",
             min_value=1.0,
@@ -1804,7 +1826,8 @@ def create_strategy_page():
         missing = [
             n for n, v in (
                 ("Capital", capital), ("Candle timeframe", tf_label),
-                ("Amount per position", position_amount), ("Target %", target_pct),
+                (("Lots per position", lots_per_pos) if use_lots else ("Amount per position", position_amount)),
+                ("Target %", target_pct),
             ) if not v
         ]
         if missing:
@@ -1822,7 +1845,8 @@ def create_strategy_page():
                 "tf_min": tf_min,
                 "max_open": int(max_open),
                 "no_limit": no_limit,
-                "position_amount": float(position_amount),
+                "position_amount": float(position_amount or 0),
+                "lots_per_position": lots_per_pos if use_lots else 0,
                 "target_pct": float(target_pct),
             }
             path = save_strategy_config(uid, folder, file_name, data)
@@ -1898,10 +1922,12 @@ def file_dashboard():
     target_pct = cfg_data.get("target_pct", 1.0)
     items = cfg_data.get("items", [])
     position_amount = cfg_data.get("position_amount", 0)
+    lots_cfg = int(cfg_data.get("lots_per_position", 0) or 0)
+    size_txt = f"{lots_cfg} lot(s)/pos" if lots_cfg else f"amount/pos {position_amount:,.0f}"
     st.info(
         f"**{exchange}**  |  {tf_label}  |  capital {capital:,.0f}  |  "
         f"max positions {'no limit' if no_limit else max_open}  |  "
-        f"amount/pos {position_amount:,.0f}  |  target {target_pct}%  |  stocks {len(items)}"
+        f"{size_txt}  |  target {target_pct}%  |  stocks {len(items)}"
     )
 
     if start_clicked:
@@ -1920,6 +1946,7 @@ def file_dashboard():
                 tf_min=int(tf_min),
                 position_amount=float(position_amount or 0),
                 no_limit=bool(no_limit),
+                lots_per_position=lots_cfg,
             )
             smart = engine.smart or st.session_state.smart
             engine.start(smart, cfg, items, exchange, False)
@@ -1956,11 +1983,22 @@ def file_dashboard():
             max_pick = st.selectbox("Max open positions", max_opts, index=max_opts.index(cur_max) if cur_max in max_opts else 0)
             new_no_limit = max_pick == NO_LIMIT
             new_max = 10 ** 6 if new_no_limit else int(max_pick)
-            new_amt = st.number_input(
-                "Amount per position", min_value=1.0,
-                value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
-                step=1000.0,
-            )
+            cur_lots = int(cfg_data.get("lots_per_position", 0) or 0)
+            new_use_lots, new_lots = False, 0
+            if new_ex in ("MCX", "NFO"):
+                new_use_lots = st.radio(
+                    "Position size", ["Lots", "Amount"], index=0 if cur_lots > 0 else 1,
+                    horizontal=True, key="edit_size_mode",
+                ) == "Lots"
+            if new_use_lots:
+                new_lots = int(st.number_input("Lots per position", min_value=1, value=max(cur_lots, 1), step=1, key="edit_lots"))
+                new_amt = 0.0
+            else:
+                new_amt = st.number_input(
+                    "Amount per position", min_value=1.0,
+                    value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
+                    step=1000.0,
+                )
             new_tgt = st.number_input("Target (%)", min_value=0.1, max_value=20.0, value=float(target_pct), step=0.1)
             if st.button("Save settings"):
                 interval, tf_min = TIMEFRAMES[new_tf]
@@ -1974,6 +2012,7 @@ def file_dashboard():
                     "max_open": int(new_max),
                     "no_limit": new_no_limit,
                     "position_amount": float(new_amt),
+                    "lots_per_position": new_lots if new_use_lots else 0,
                     "target_pct": float(new_tgt),
                 }
                 save_strategy_config(uid, folder, file_name, data)
