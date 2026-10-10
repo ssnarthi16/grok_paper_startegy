@@ -1650,16 +1650,33 @@ def _money(x):
     return f":green[{s}]" if x > 0 else f":red[{s}]" if x < 0 else f"{x:,.2f}"
 
 
-def _pnl_line(uid, path, capital=None):
-    """One file's P&L (this block refreshes by itself while the file is running)."""
-    p = strategy_pnl(uid, path)
+def _pnl_sum(uid, paths):
+    """Added-up P&L of one file (paths=[p]) or a whole folder (paths=[p1, p2, ...])."""
+    tot = {"open": 0, "closed": 0, "realized": 0.0, "unrealized": 0.0}
+    for p in paths:
+        s = strategy_pnl(uid, p)
+        for k in tot:
+            tot[k] += s[k]
+    tot["total"] = tot["realized"] + tot["unrealized"]
+    return tot
+
+
+def _pnl_left(uid, paths):
+    """Under the name: Open / Closed / Realized."""
+    t = _pnl_sum(uid, paths)
+    st.markdown(f"Open **{t['open']}** · Closed **{t['closed']}**  \n"
+                f"Realized {_money(t['realized'])}")
+
+
+def _pnl_right(uid, paths, capital=None):
+    """On the side: Unrealized / Total."""
+    t = _pnl_sum(uid, paths)
     try:
-        pct = f" ({p['total'] / float(capital) * 100:+.2f}%)" if capital else ""
+        pct = f" ({t['total'] / float(capital) * 100:+.2f}%)" if capital else ""
     except (TypeError, ValueError):
         pct = ""
-    st.markdown(f"Open **{p['open']}** · Closed **{p['closed']}**  \n"
-                f"Realized {_money(p['realized'])} · Unrealized {_money(p['unrealized'])}  \n"
-                f"**Total** {_money(p['total'])}{pct}")
+    st.markdown(f"Unrealized {_money(t['unrealized'])}  \n"
+                f"**Total** {_money(t['total'])}{pct}")
 
 
 def _overall_panel(uid):
@@ -1760,54 +1777,76 @@ def strategies_home():
     frag = getattr(st, "fragment", None) or st.experimental_fragment
 
     # ---------- every folder / file ----------
+    def _go_file(folder, meta, edit=False):
+        if edit:
+            st.session_state["edit_open"] = f"{folder}/{meta['file']}"
+        else:
+            st.session_state.pop("edit_open", None)
+        st.session_state["active_strategy"] = {"folder": folder, "file": meta["file"], "path": meta["path"]}
+        _set_nav("file", folder, meta["file"])
+        st.rerun()
+
     for folder, files in strategies.items():
-        st.subheader(f"📁 {folder}")
+        f_paths = [m["path"] for m in files]
+        f_cap = 0.0
+        for m in files:
+            try:
+                f_cap += float(m.get("capital") or 0)
+            except (TypeError, ValueError):
+                pass
+        f_run = 2 if any(m.get("running") for m in files) else None
+
+        # ----- FOLDER: name + Open/Closed/Realized on the left, Unrealized/Total on the right -----
+        with st.container(border=True):
+            fl, fr = st.columns([1, 1])
+            with fl:
+                st.subheader(f"📁 {folder}")
+                frag(run_every=f_run)(_pnl_left)(uid, f_paths)
+            with fr:
+                st.write("")
+                frag(run_every=f_run)(_pnl_right)(uid, f_paths, f_cap)
+
+        # ----- FILES -----
         for meta in files:
             running = meta.get("running", False)
+            run_every = 2 if running else None
             badge = "🟢 RUNNING" if running else "⚪ STOPPED"
             exchange = meta.get("exchange", "-")
             tf = meta.get("tf_label", "-")
             capital = meta.get("capital", "-")
+            paths = [meta["path"]]
             has_open = strategy_pnl(uid, meta["path"])["open"] > 0
-            c_info, c_pnl, c_open, c_edit, c_exit, c_del = st.columns([3, 3.4, 1, 1, 1, 1])
-            with c_info:
-                st.write(f"**{meta['file']}**  ·  {badge}  ·  {exchange} · {tf} · capital {capital}")
-            with c_pnl:
-                frag(run_every=2 if running else None)(_pnl_line)(uid, meta["path"], capital)
-            with c_open:
-                if st.button("Open", key=f"open_{folder}_{meta['file']}", use_container_width=True):
-                    st.session_state.pop("edit_open", None)
-                    st.session_state["active_strategy"] = {
-                        "folder": folder, "file": meta["file"], "path": meta["path"],
-                    }
-                    _set_nav("file", folder, meta["file"])
-                    st.rerun()
-            with c_edit:
-                if st.button("Edit", key=f"edit_{folder}_{meta['file']}", use_container_width=True,
-                             help="Settings maatha (running-ah irundhaalum maathalaam)"):
-                    st.session_state["edit_open"] = f"{folder}/{meta['file']}"
-                    st.session_state["active_strategy"] = {
-                        "folder": folder, "file": meta["file"], "path": meta["path"],
-                    }
-                    _set_nav("file", folder, meta["file"])
-                    st.rerun()
-            with c_exit:
-                if st.button("Exit", key=f"exit_{folder}_{meta['file']}", use_container_width=True,
-                             disabled=not (running or has_open),
-                             help="Indha file-oda ellaa open positions-ayum last price-la close panni, strategy-ah stop pannum"):
-                    n = get_strategy_engine(uid, meta["path"]).exit_all("Manual exit (Exit)")
-                    st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
-                                                 "strategy stopped.")
-                    st.rerun()
-            with c_del:
-                if st.button("Delete", key=f"del_{folder}_{meta['file']}", use_container_width=True):
-                    if running:
-                        st.warning("Stop first, then delete.")
-                    elif has_open:
-                        st.warning("Open positions irukku - Exit pannittu delete pannunga.")
-                    else:
-                        delete_strategy(uid, folder, meta["file"])
+            with st.container(border=True):
+                c_left, c_right = st.columns([1, 1])
+                with c_left:
+                    # click the file name = open the file
+                    # (type="tertiary" needs Streamlit 1.46+; on older versions remove it)
+                    if st.button(f"📄 {meta['file']}", key=f"open_{folder}_{meta['file']}", type="tertiary",
+                                 help="Click pannaa file open aagum"):
+                        _go_file(folder, meta)
+                    st.caption(f"{badge}  ·  {exchange} · {tf} · capital {capital}")
+                    frag(run_every=run_every)(_pnl_left)(uid, paths)
+                with c_right:
+                    frag(run_every=run_every)(_pnl_right)(uid, paths, capital)
+                    b1, b2, b3, _sp = st.columns([1, 1, 1, 1.5])
+                    if b1.button("Edit", key=f"edit_{folder}_{meta['file']}", use_container_width=True,
+                                 help="Settings maatha (running-ah irundhaalum maathalaam)"):
+                        _go_file(folder, meta, edit=True)
+                    if b2.button("Exit", key=f"exit_{folder}_{meta['file']}", use_container_width=True,
+                                 disabled=not (running or has_open),
+                                 help="Indha file-oda ellaa open positions-ayum last price-la close panni, strategy-ah stop pannum"):
+                        n = get_strategy_engine(uid, meta["path"]).exit_all("Manual exit (Exit)")
+                        st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
+                                                     "strategy stopped.")
                         st.rerun()
+                    if b3.button("Delete", key=f"del_{folder}_{meta['file']}", use_container_width=True):
+                        if running:
+                            st.warning("Stop first, then delete.")
+                        elif has_open:
+                            st.warning("Open positions irukku - Exit pannittu delete pannunga.")
+                        else:
+                            delete_strategy(uid, folder, meta["file"])
+                            st.rerun()
 
 
 def create_strategy_page():
