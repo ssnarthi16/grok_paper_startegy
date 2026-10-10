@@ -737,6 +737,13 @@ class Engine:
             self.state["open"] = [p for p in self.state["open"] if f"{p['exchange']}:{p['symbol']}" != key]
             save_state(self.state)
 
+    def update_config(self, cfg):
+        """Change target %, max positions, amount, capital of a RUNNING strategy - no restart, positions untouched.
+           New values are used for the next entries (open positions keep the target they were entered with)."""
+        with self.lock:
+            self.cfg = cfg
+        self._save_run_config(self.running)
+
     def exit_all(self, reason="Manual exit (Exit)"):
         """EXIT = stop the strategy (no new entries) and close every open position at its last price.
            Returns how many positions were closed. Works even if the strategy is already stopped."""
@@ -1686,7 +1693,6 @@ def strategies_home():
 
     with st.sidebar:
         st.write(f"Connected: **{st.session_state.get('client_id', '-')}**")
-        st.caption(f"Save path: `{user_strategies_root(uid)}`")
         _reg = _engine_registry()
         with _reg["lock"]:
             n_running = sum(1 for k, e in _reg["map"].items() if k.startswith(f"{uid}::") and e.running)
@@ -1709,12 +1715,27 @@ def strategies_home():
             st.session_state.pop("create_file", None)
             _set_nav("create")
             st.rerun()
+        with st.expander("Exit ALL"):
+            gen = st.session_state.get("exit_gen", 0)
+            st.caption("Ellaa strategies-oda ellaa open positions-ayum last price-la close panni, ellaa strategies-ayum stop pannum.")
+            exit_ok = st.checkbox("Confirm", key=f"exit_all_ok_{gen}")
+            if st.button("Exit ALL", type="primary", use_container_width=True,
+                         disabled=not exit_ok, key=f"exit_all_btn_{gen}"):
+                closed_n = stopped_n = 0
+                for fl in list_strategies(uid).values():
+                    for m in fl:
+                        eng = get_strategy_engine(uid, m["path"])
+                        was_running = eng.running
+                        closed_n += eng.exit_all("Manual exit (Exit ALL)")
+                        stopped_n += 1 if was_running else 0
+                st.session_state["flash"] = f"Exit ALL: {closed_n} position(s) closed, {stopped_n} strategy stopped."
+                st.session_state["exit_gen"] = gen + 1        # new, un-ticked Confirm box
+                st.rerun()
 
     root = user_strategies_root(uid)
     strategies = list_strategies(uid)
     if not strategies:
         st.info("No strategies yet. Sidebar-la **+ New strategy / file** click pannunga.")
-        st.caption(f"Save location: `{root}`")
         # Show raw disk contents so we can see if files exist but failed to load
         try:
             raw = []
@@ -1737,29 +1758,6 @@ def strategies_home():
         st.success(flash)
 
     frag = getattr(st, "fragment", None) or st.experimental_fragment
-    any_running = any(m.get("running") for fl in strategies.values() for m in fl)
-
-    # ---------- OVERALL: live P&L of all files + Exit ALL ----------
-    st.subheader("Overall")
-    frag(run_every=2 if any_running else None)(_overall_panel)(uid)
-    gen = st.session_state.get("exit_gen", 0)
-    ca, cb = st.columns([1, 3])
-    with ca:
-        exit_ok = st.checkbox("Confirm", key=f"exit_all_ok_{gen}")
-    with cb:
-        if st.button("Exit ALL - close every open position + stop every strategy", type="primary",
-                     disabled=not exit_ok, key=f"exit_all_btn_{gen}"):
-            closed_n = stopped_n = 0
-            for fl in strategies.values():
-                for m in fl:
-                    eng = get_strategy_engine(uid, m["path"])
-                    was_running = eng.running
-                    closed_n += eng.exit_all("Manual exit (Exit ALL)")
-                    stopped_n += 1 if was_running else 0
-            st.session_state["flash"] = f"Exit ALL: {closed_n} position(s) closed, {stopped_n} strategy stopped."
-            st.session_state["exit_gen"] = gen + 1        # new, un-ticked Confirm box
-            st.rerun()
-    st.divider()
 
     # ---------- every folder / file ----------
     for folder, files in strategies.items():
@@ -1786,7 +1784,7 @@ def strategies_home():
                     st.rerun()
             with c_edit:
                 if st.button("Edit", key=f"edit_{folder}_{meta['file']}", use_container_width=True,
-                             disabled=running, help="Settings maatha - Stop-la irukkumbodhu mattum"):
+                             help="Settings maatha (running-ah irundhaalum maathalaam)"):
                     st.session_state["edit_open"] = f"{folder}/{meta['file']}"
                     st.session_state["active_strategy"] = {
                         "folder": folder, "file": meta["file"], "path": meta["path"],
@@ -1823,7 +1821,6 @@ def create_strategy_page():
         st.rerun()
 
     st.title("New strategy / file")
-    st.caption(f"Will save under: `{user_strategies_root(uid)}`")
 
     if step == 1:
         st.subheader("Step 1 · Folder & File name")
@@ -1962,7 +1959,7 @@ def create_strategy_page():
             for k in ("create_step", "create_folder", "create_file"):
                 st.session_state.pop(k, None)
             _set_nav("file", sf, sn)
-            st.success(f"Saved at `{path}`")
+            st.success("Saved.")
             st.rerun()
 
 
@@ -1988,7 +1985,7 @@ def file_dashboard():
     folder, file_name = active["folder"], active["file"]
     cfg_data = load_strategy_config(path)
     if not cfg_data:
-        st.error(f"Config not found at `{path}`.")
+        st.error("Indha file-oda config kidaikkala.")
         if st.button("Back"):
             _set_nav("home")
             st.rerun()
@@ -2010,6 +2007,9 @@ def file_dashboard():
         st.rerun()
 
     st.title(f"{folder} / {file_name}")
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
 
     # Start / Stop
     c1, c2, c3 = st.columns([1, 1, 3])
@@ -2055,62 +2055,96 @@ def file_dashboard():
             engine.start(smart, cfg, items, exchange, False)
             st.rerun()
 
-    # Edit settings (only when stopped)
-    if not engine.running:
-        with st.expander("Edit settings (Stop-la irukkumbodhu mattum)",
-                         expanded=st.session_state.get("edit_open") == f"{folder}/{file_name}"):
-            smart = st.session_state.smart
-            try:
-                master = load_master()
-            except Exception:
-                master = None
-            new_ex = st.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"], index=["NSE", "BSE", "NFO", "MCX"].index(exchange) if exchange in ("NSE", "BSE", "NFO", "MCX") else 0)
-            new_items = []
-            if master is not None:
-                inst = exchange_list_cached(new_ex)
-                labels = inst["label"].tolist()
-                by_label = inst.set_index("label")
-                current_syms = [it["symbol"] for it in items if it.get("exchange") == new_ex]
-                default_pick = [x for x in current_syms if x in labels]
-                pick_all = st.checkbox(f"Select all {len(labels)}", key=f"edit_all_{new_ex}")
-                picked = labels if pick_all else st.multiselect(
-                    f"{new_ex} stocks", labels, default=default_pick, key=f"edit_stocks_{new_ex}",
-                )
-                new_items = [to_item({**by_label.loc[n].to_dict(), "label": n}, new_ex) for n in picked]
-            new_capital = st.number_input("Capital", min_value=10000.0, value=float(capital), step=10000.0)
-            tf_keys = list(TIMEFRAMES)
-            tf_idx = tf_keys.index(tf_label) if tf_label in tf_keys else 2
-            new_tf = st.selectbox("Candle timeframe", tf_keys, index=tf_idx)
-            NO_LIMIT = "Select max (no limit)"
-            max_opts = [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50]
-            cur_max = NO_LIMIT if no_limit else (max_open if max_open in max_opts else 5)
-            max_pick = st.selectbox("Max open positions", max_opts, index=max_opts.index(cur_max) if cur_max in max_opts else 0)
-            new_no_limit = max_pick == NO_LIMIT
-            new_max = 10 ** 6 if new_no_limit else int(max_pick)
-            new_amt = st.number_input(
-                "Amount per position", min_value=1.0,
-                value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
-                step=1000.0,
+    # Edit settings (also while RUNNING)
+    with st.expander("Edit settings (running-ah irundhaalum maathalaam)",
+                     expanded=st.session_state.get("edit_open") == f"{folder}/{file_name}"):
+        open_now_ = engine.snapshot()["state"]["open"]
+        has_open_pos = bool(open_now_)
+        if engine.running:
+            st.caption("Running: target %, max positions, amount, capital udane apply aagum (restart illa). "
+                       "Stocks / timeframe maathinaa strategy konjam second restart aagum - open positions appadiye irukkum.")
+        smart = st.session_state.smart
+        try:
+            master = load_master()
+        except Exception:
+            master = None
+        new_ex = st.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"], disabled=has_open_pos,
+                              index=["NSE", "BSE", "NFO", "MCX"].index(exchange) if exchange in ("NSE", "BSE", "NFO", "MCX") else 0)
+        if has_open_pos:
+            st.caption("Open positions irukkumbodhu Exchange maatha mudiyaadhu (ellaam exit aanadhum maathalaam).")
+        new_items = []
+        if master is not None:
+            inst = exchange_list_cached(new_ex)
+            labels = inst["label"].tolist()
+            by_label = inst.set_index("label")
+            current_syms = [it["symbol"] for it in items if it.get("exchange") == new_ex]
+            default_pick = [x for x in current_syms if x in labels]
+            pick_all = st.checkbox(f"Select all {len(labels)}", key=f"edit_all_{new_ex}")
+            picked = labels if pick_all else st.multiselect(
+                f"{new_ex} stocks", labels, default=default_pick, key=f"edit_stocks_{new_ex}",
             )
-            new_tgt = st.number_input("Target (%)", min_value=0.1, max_value=20.0, value=float(target_pct), step=0.1)
-            if st.button("Save settings"):
-                interval, tf_min = TIMEFRAMES[new_tf]
-                data = {
-                    "exchange": new_ex,
-                    "items": new_items or items,
-                    "capital": float(new_capital),
-                    "tf_label": new_tf,
-                    "interval": interval,
-                    "tf_min": tf_min,
-                    "max_open": int(new_max),
-                    "no_limit": new_no_limit,
-                    "position_amount": float(new_amt),
-                    "target_pct": float(new_tgt),
-                }
-                save_strategy_config(uid, folder, file_name, data)
-                st.session_state.pop("edit_open", None)
-                st.success("Settings saved.")
-                st.rerun()
+            new_items = [to_item({**by_label.loc[n].to_dict(), "label": n}, new_ex) for n in picked]
+        new_capital = st.number_input("Capital", min_value=10000.0, value=float(capital), step=10000.0)
+        tf_keys = list(TIMEFRAMES)
+        tf_idx = tf_keys.index(tf_label) if tf_label in tf_keys else 2
+        new_tf = st.selectbox("Candle timeframe", tf_keys, index=tf_idx)
+        NO_LIMIT = "Select max (no limit)"
+        max_opts = [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50]
+        cur_max = NO_LIMIT if no_limit else (max_open if max_open in max_opts else 5)
+        max_pick = st.selectbox("Max open positions", max_opts, index=max_opts.index(cur_max) if cur_max in max_opts else 0)
+        new_no_limit = max_pick == NO_LIMIT
+        new_max = 10 ** 6 if new_no_limit else int(max_pick)
+        new_amt = st.number_input(
+            "Amount per position", min_value=1.0,
+            value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
+            step=1000.0,
+        )
+        new_tgt = st.number_input("Target (%)", min_value=0.1, max_value=20.0, value=float(target_pct), step=0.1)
+        if st.button("Save settings"):
+            interval, tf_min = TIMEFRAMES[new_tf]
+            data = {
+                "exchange": new_ex,
+                "items": new_items or items,
+                "capital": float(new_capital),
+                "tf_label": new_tf,
+                "interval": interval,
+                "tf_min": tf_min,
+                "max_open": int(new_max),
+                "no_limit": new_no_limit,
+                "position_amount": float(new_amt),
+                "target_pct": float(new_tgt),
+            }
+            # a stock that still has an OPEN position stays in the list until that position exits
+            final_items = list(new_items or items)
+            have = {(it.get("exchange"), it["symbol"]) for it in final_items}
+            open_keys = {(p["exchange"], p["symbol"]) for p in open_now_}
+            kept = [it for it in items if (it.get("exchange"), it["symbol"]) in open_keys
+                    and (it.get("exchange"), it["symbol"]) not in have]
+            final_items += kept
+            data["items"] = final_items
+            save_strategy_config(uid, folder, file_name, data)
+            msg = "Settings saved."
+            if kept:
+                msg += " Open position irukkura " + ", ".join(it["symbol"] for it in kept) + " exit aagura varaikum list-la irukkum."
+            if engine.running:
+                new_cfg = Config(capital=float(new_capital), max_open=int(new_max), target_pct=float(new_tgt),
+                                 interval=interval, tf_min=int(tf_min), position_amount=float(new_amt),
+                                 no_limit=bool(new_no_limit))
+                same_watch = (new_ex == exchange and int(tf_min) == int(cfg_data.get("tf_min", 5))
+                              and {(i.get("exchange"), i["symbol"]) for i in final_items}
+                              == {(i.get("exchange"), i["symbol"]) for i in items})
+                smart_ = engine.smart or st.session_state.get("smart")
+                if same_watch:
+                    engine.update_config(new_cfg)                    # numbers only -> instant, no restart
+                    msg += " Running strategy-ku udane apply aachu."
+                elif smart_ is None:
+                    msg += " (Angel login illa - running strategy-ku apply aagala, Stop pannittu Start pannunga.)"
+                else:
+                    engine.start(smart_, new_cfg, final_items, new_ex, False)   # open positions are kept
+                    msg += " Strategy restart aachu (open positions appadiye irukku)."
+            st.session_state.pop("edit_open", None)
+            st.session_state["flash"] = msg
+            st.rerun()
 
     # Manage positions
     open_now = engine.snapshot()["state"]["open"]
