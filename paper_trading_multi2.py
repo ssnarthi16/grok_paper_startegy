@@ -67,7 +67,6 @@ class Config:
     patterns: tuple = PATTERNS
     position_amount: float = 0.0
     no_limit: bool = False
-    lots_per_position: int = 0                 # MCX / NFO: fixed lots per position (0 = use the amount instead)
 
     @property
     def per_position(self):
@@ -738,6 +737,28 @@ class Engine:
             self.state["open"] = [p for p in self.state["open"] if f"{p['exchange']}:{p['symbol']}" != key]
             save_state(self.state)
 
+    def exit_all(self, reason="Manual exit (Exit)"):
+        """EXIT = stop the strategy (no new entries) and close every open position at its last price.
+           Returns how many positions were closed. Works even if the strategy is already stopped."""
+        self.stop()
+        with self.lock:
+            cfg = self.cfg or Config()
+            n = 0
+            for p in list(self.state["open"]):
+                _close(self.state, cfg, p, p.get("last_price") or p["entry"], now_ist(), reason)
+                n += 1
+            save_state(self.state)
+        try:                                              # a stopped file must not be auto-resumed after a restart
+            if os.path.exists(self.run_file):
+                with open(self.run_file) as f:
+                    rc = json.load(f)
+                rc["running"] = False
+                with open(self.run_file, "w") as f:
+                    json.dump(rc, f, default=str)
+        except Exception:
+            pass
+        return n
+
     def snapshot(self):
         with self.lock:
             return {
@@ -984,22 +1005,8 @@ class Engine:
             - sum(p["entry"] * p["qty"] * p.get("mf", 1.0) for p in state["open"])
         )
         one_lot = entry * lot * mf
-        by_lots = cfg.lots_per_position > 0 and ex in ("MCX", "NFO")
-        if by_lots:                                         # you chose the number of lots
-            n_lots = cfg.lots_per_position
-            qty = n_lots * lot if one_lot * n_lots <= cash else 0
-        else:                                               # amount per position
-            qty = math.floor(min(cfg.per_position, cash) / one_lot) * lot
-        if qty < 1 and by_lots:
-            need = one_lot * cfg.lots_per_position
-            rec["status"] = f"SKIPPED ({cfg.lots_per_position} lot(s) need {need:,.0f})"
-            add_log(
-                state, now,
-                f"SKIPPED {sym}: {cfg.lots_per_position} lot(s) = {cfg.lots_per_position * lot} units need "
-                f"{need:,.0f} margin (price {entry:.2f}{f' x margin {mf * 100:g}%' if mf < 1 else ''}) "
-                f"but free cash is {cash:,.0f}",
-            )
-        elif qty < 1:
+        qty = math.floor(min(cfg.per_position, cash) / one_lot) * lot
+        if qty < 1:
             rec["status"] = f"SKIPPED (1 lot needs {one_lot:,.0f})"
             add_log(
                 state, now,
@@ -1453,10 +1460,9 @@ def live_top(engine, exchange, tf_label):
         else f"{exchange} market CLOSED (entry/exit run {hrs} IST, Mon-Fri)"
     )
     upd = f"{snap['last_update']:%H:%M:%S}" if snap["last_update"] is not None else "-"
-    pp_txt = f"{cfg.lots_per_position} lot(s)" if cfg.lots_per_position else f"{cfg.per_position:,.0f}"
     st.write(
         f"**{'RUNNING' if snap['running'] else 'STOPPED'}**  |  {mkt}  |  now {now:%H:%M:%S} IST  |  "
-        f"prices updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {pp_txt}"
+        f"prices updated {upd}  |  timeframe: {tf_label or '-'}  |  per position: {cfg.per_position:,.0f}"
     )
     if snap["running"]:
         st.caption(f"Engine: {snap['status']}")
@@ -1617,6 +1623,60 @@ def _set_nav(page="home", folder="", file=""):
     st.query_params.from_dict(qp)
 
 
+def strategy_pnl(uid, path):
+    """P&L of one file: live from its engine if it is in memory, otherwise from its saved state."""
+    eng = _get_engine_by_path(uid, path)
+    if eng is not None:
+        with eng.lock:
+            op, cl = list(eng.state["open"]), list(eng.state["closed"])
+    else:
+        s = load_state(os.path.join(path, "live_state.json"))
+        op, cl = s["open"], s["closed"]
+    realized = sum(float(t.get("pnl") or 0) for t in cl)
+    unreal = sum((float(p.get("last_price") or p["entry"]) - float(p["entry"])) * float(p["qty"]) for p in op)
+    return {"open": len(op), "closed": len(cl), "realized": realized, "unrealized": unreal,
+            "total": realized + unreal}
+
+
+def _money(x):
+    s = f"{x:+,.2f}"
+    return f":green[{s}]" if x > 0 else f":red[{s}]" if x < 0 else f"{x:,.2f}"
+
+
+def _pnl_line(uid, path, capital=None):
+    """One file's P&L (this block refreshes by itself while the file is running)."""
+    p = strategy_pnl(uid, path)
+    try:
+        pct = f" ({p['total'] / float(capital) * 100:+.2f}%)" if capital else ""
+    except (TypeError, ValueError):
+        pct = ""
+    st.markdown(f"Open **{p['open']}** · Closed **{p['closed']}**  \n"
+                f"Realized {_money(p['realized'])} · Unrealized {_money(p['unrealized'])}  \n"
+                f"**Total** {_money(p['total'])}{pct}")
+
+
+def _overall_panel(uid):
+    """Live P&L of ALL files together."""
+    files = [m for fl in list_strategies(uid).values() for m in fl]
+    tot = {"open": 0, "closed": 0, "realized": 0.0, "unrealized": 0.0}
+    cap = 0.0
+    for m in files:
+        p = strategy_pnl(uid, m["path"])
+        for k in tot:
+            tot[k] += p[k]
+        try:
+            cap += float(m.get("capital") or 0)
+        except (TypeError, ValueError):
+            pass
+    total = tot["realized"] + tot["unrealized"]
+    c = st.columns(5)
+    c[0].metric("Strategies running", f"{sum(1 for m in files if m.get('running'))} / {len(files)}")
+    c[1].metric("Open positions", tot["open"])
+    c[2].metric("Realized P&L", f"{tot['realized']:,.0f}")
+    c[3].metric("Unrealized P&L", f"{tot['unrealized']:,.0f}")
+    c[4].metric("Total P&L", f"{total:,.0f}", f"{total / cap * 100:.2f}%" if cap else None)
+
+
 def strategies_home():
     """Folder / File list + New + open file."""
     uid = current_uid()
@@ -1654,6 +1714,7 @@ def strategies_home():
     strategies = list_strategies(uid)
     if not strategies:
         st.info("No strategies yet. Sidebar-la **+ New strategy / file** click pannunga.")
+        st.caption(f"Save location: `{root}`")
         # Show raw disk contents so we can see if files exist but failed to load
         try:
             raw = []
@@ -1665,10 +1726,42 @@ def strategies_home():
                         raw.append(f"{fd}/ → {kids or '(empty)'}")
             if raw:
                 st.warning("Folders on disk but no valid config.json found:\n" + "\n".join(raw))
+            else:
+                st.caption("Disk empty — create first strategy. Streamlit Cloud app restart-la local files wipe aagalam; create pannina odane Open panni check pannunga.")
         except Exception as ex:
             st.caption(f"Could not list disk: {ex}")
         return
 
+    flash = st.session_state.pop("flash", None)          # message from the last Exit click
+    if flash:
+        st.success(flash)
+
+    frag = getattr(st, "fragment", None) or st.experimental_fragment
+    any_running = any(m.get("running") for fl in strategies.values() for m in fl)
+
+    # ---------- OVERALL: live P&L of all files + Exit ALL ----------
+    st.subheader("Overall")
+    frag(run_every=2 if any_running else None)(_overall_panel)(uid)
+    gen = st.session_state.get("exit_gen", 0)
+    ca, cb = st.columns([1, 3])
+    with ca:
+        exit_ok = st.checkbox("Confirm", key=f"exit_all_ok_{gen}")
+    with cb:
+        if st.button("Exit ALL - close every open position + stop every strategy", type="primary",
+                     disabled=not exit_ok, key=f"exit_all_btn_{gen}"):
+            closed_n = stopped_n = 0
+            for fl in strategies.values():
+                for m in fl:
+                    eng = get_strategy_engine(uid, m["path"])
+                    was_running = eng.running
+                    closed_n += eng.exit_all("Manual exit (Exit ALL)")
+                    stopped_n += 1 if was_running else 0
+            st.session_state["flash"] = f"Exit ALL: {closed_n} position(s) closed, {stopped_n} strategy stopped."
+            st.session_state["exit_gen"] = gen + 1        # new, un-ticked Confirm box
+            st.rerun()
+    st.divider()
+
+    # ---------- every folder / file ----------
     for folder, files in strategies.items():
         st.subheader(f"📁 {folder}")
         for meta in files:
@@ -1677,20 +1770,43 @@ def strategies_home():
             exchange = meta.get("exchange", "-")
             tf = meta.get("tf_label", "-")
             capital = meta.get("capital", "-")
-            col1, col2, col3 = st.columns([4, 1, 1])
-            with col1:
+            has_open = strategy_pnl(uid, meta["path"])["open"] > 0
+            c_info, c_pnl, c_open, c_edit, c_exit, c_del = st.columns([3, 3.4, 1, 1, 1, 1])
+            with c_info:
                 st.write(f"**{meta['file']}**  ·  {badge}  ·  {exchange} · {tf} · capital {capital}")
-            with col2:
+            with c_pnl:
+                frag(run_every=2 if running else None)(_pnl_line)(uid, meta["path"], capital)
+            with c_open:
                 if st.button("Open", key=f"open_{folder}_{meta['file']}", use_container_width=True):
+                    st.session_state.pop("edit_open", None)
                     st.session_state["active_strategy"] = {
                         "folder": folder, "file": meta["file"], "path": meta["path"],
                     }
                     _set_nav("file", folder, meta["file"])
                     st.rerun()
-            with col3:
+            with c_edit:
+                if st.button("Edit", key=f"edit_{folder}_{meta['file']}", use_container_width=True,
+                             disabled=running, help="Settings maatha - Stop-la irukkumbodhu mattum"):
+                    st.session_state["edit_open"] = f"{folder}/{meta['file']}"
+                    st.session_state["active_strategy"] = {
+                        "folder": folder, "file": meta["file"], "path": meta["path"],
+                    }
+                    _set_nav("file", folder, meta["file"])
+                    st.rerun()
+            with c_exit:
+                if st.button("Exit", key=f"exit_{folder}_{meta['file']}", use_container_width=True,
+                             disabled=not (running or has_open),
+                             help="Indha file-oda ellaa open positions-ayum last price-la close panni, strategy-ah stop pannum"):
+                    n = get_strategy_engine(uid, meta["path"]).exit_all("Manual exit (Exit)")
+                    st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
+                                                 "strategy stopped.")
+                    st.rerun()
+            with c_del:
                 if st.button("Delete", key=f"del_{folder}_{meta['file']}", use_container_width=True):
                     if running:
                         st.warning("Stop first, then delete.")
+                    elif has_open:
+                        st.warning("Open positions irukku - Exit pannittu delete pannunga.")
                     else:
                         delete_strategy(uid, folder, meta["file"])
                         st.rerun()
@@ -1798,22 +1914,13 @@ def create_strategy_page():
     NO_LIMIT = "Select max (no limit)"
     max_pick = st.selectbox("Max open positions", [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50], index=0)
     no_limit = max_pick == NO_LIMIT
-    max_open = 10 ** 6 if no_limit else int(max_pick)
-    use_lots, lots_per_pos = False, 0
-    if exchange in ("MCX", "NFO"):
-        use_lots = st.radio("Position size", ["Lots", "Amount"], horizontal=True, key="create_size_mode") == "Lots"
-    if use_lots:
-        lots_val = st.number_input("Lots per position", min_value=1, value=None, step=1, placeholder="Lots", key="create_lots")
-        lots_per_pos = int(lots_val) if lots_val else 0
-        info = ", ".join(f"{it['symbol']}: 1 lot = {it['lot']} units" for it in items[:6])
-        if info:
-            st.caption(info + (" ..." if len(items) > 6 else ""))
-        position_amount = 0.0
-    elif no_limit:
+    if no_limit:
+        max_open = 10 ** 6
         position_amount = st.number_input(
             "Amount per position", min_value=1.0, value=None, step=1000.0, placeholder="Amount",
         )
     else:
+        max_open = int(max_pick)
         position_amount = st.number_input(
             "Amount per position",
             min_value=1.0,
@@ -1826,8 +1933,7 @@ def create_strategy_page():
         missing = [
             n for n, v in (
                 ("Capital", capital), ("Candle timeframe", tf_label),
-                (("Lots per position", lots_per_pos) if use_lots else ("Amount per position", position_amount)),
-                ("Target %", target_pct),
+                ("Amount per position", position_amount), ("Target %", target_pct),
             ) if not v
         ]
         if missing:
@@ -1845,8 +1951,7 @@ def create_strategy_page():
                 "tf_min": tf_min,
                 "max_open": int(max_open),
                 "no_limit": no_limit,
-                "position_amount": float(position_amount or 0),
-                "lots_per_position": lots_per_pos if use_lots else 0,
+                "position_amount": float(position_amount),
                 "target_pct": float(target_pct),
             }
             path = save_strategy_config(uid, folder, file_name, data)
@@ -1899,6 +2004,7 @@ def file_dashboard():
 
     no_dim()
     if st.button("← Back to Strategies"):
+        st.session_state.pop("edit_open", None)
         st.session_state.pop("active_strategy", None)
         _set_nav("home")
         st.rerun()
@@ -1922,12 +2028,10 @@ def file_dashboard():
     target_pct = cfg_data.get("target_pct", 1.0)
     items = cfg_data.get("items", [])
     position_amount = cfg_data.get("position_amount", 0)
-    lots_cfg = int(cfg_data.get("lots_per_position", 0) or 0)
-    size_txt = f"{lots_cfg} lot(s)/pos" if lots_cfg else f"amount/pos {position_amount:,.0f}"
     st.info(
         f"**{exchange}**  |  {tf_label}  |  capital {capital:,.0f}  |  "
         f"max positions {'no limit' if no_limit else max_open}  |  "
-        f"{size_txt}  |  target {target_pct}%  |  stocks {len(items)}"
+        f"amount/pos {position_amount:,.0f}  |  target {target_pct}%  |  stocks {len(items)}"
     )
 
     if start_clicked:
@@ -1946,7 +2050,6 @@ def file_dashboard():
                 tf_min=int(tf_min),
                 position_amount=float(position_amount or 0),
                 no_limit=bool(no_limit),
-                lots_per_position=lots_cfg,
             )
             smart = engine.smart or st.session_state.smart
             engine.start(smart, cfg, items, exchange, False)
@@ -1954,7 +2057,8 @@ def file_dashboard():
 
     # Edit settings (only when stopped)
     if not engine.running:
-        with st.expander("Edit settings (Stop-la irukkumbodhu mattum)"):
+        with st.expander("Edit settings (Stop-la irukkumbodhu mattum)",
+                         expanded=st.session_state.get("edit_open") == f"{folder}/{file_name}"):
             smart = st.session_state.smart
             try:
                 master = load_master()
@@ -1983,22 +2087,11 @@ def file_dashboard():
             max_pick = st.selectbox("Max open positions", max_opts, index=max_opts.index(cur_max) if cur_max in max_opts else 0)
             new_no_limit = max_pick == NO_LIMIT
             new_max = 10 ** 6 if new_no_limit else int(max_pick)
-            cur_lots = int(cfg_data.get("lots_per_position", 0) or 0)
-            new_use_lots, new_lots = False, 0
-            if new_ex in ("MCX", "NFO"):
-                new_use_lots = st.radio(
-                    "Position size", ["Lots", "Amount"], index=0 if cur_lots > 0 else 1,
-                    horizontal=True, key="edit_size_mode",
-                ) == "Lots"
-            if new_use_lots:
-                new_lots = int(st.number_input("Lots per position", min_value=1, value=max(cur_lots, 1), step=1, key="edit_lots"))
-                new_amt = 0.0
-            else:
-                new_amt = st.number_input(
-                    "Amount per position", min_value=1.0,
-                    value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
-                    step=1000.0,
-                )
+            new_amt = st.number_input(
+                "Amount per position", min_value=1.0,
+                value=float(position_amount) if position_amount else float(round(new_capital / max(new_max, 1), 2)),
+                step=1000.0,
+            )
             new_tgt = st.number_input("Target (%)", min_value=0.1, max_value=20.0, value=float(target_pct), step=0.1)
             if st.button("Save settings"):
                 interval, tf_min = TIMEFRAMES[new_tf]
@@ -2012,10 +2105,10 @@ def file_dashboard():
                     "max_open": int(new_max),
                     "no_limit": new_no_limit,
                     "position_amount": float(new_amt),
-                    "lots_per_position": new_lots if new_use_lots else 0,
                     "target_pct": float(new_tgt),
                 }
                 save_strategy_config(uid, folder, file_name, data)
+                st.session_state.pop("edit_open", None)
                 st.success("Settings saved.")
                 st.rerun()
 
