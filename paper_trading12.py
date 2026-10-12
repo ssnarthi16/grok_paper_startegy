@@ -1709,7 +1709,14 @@ def _overall_panel(uid):
 
 def top_nav(active):
     """Top menu: Strategy | Paper Trading."""
-    cols = st.columns([1, 1, 5])
+    st.markdown(
+        """<style>
+        [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+        [data-testid="collapsedControl"] { display: none !important; }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns([1.4, 1.8, 4])
     for col, (key, label) in zip(cols[:2], (("home", "📁 Strategy"), ("paper", "📈 Paper Trading"))):
         if col.button(label, key=f"nav_{key}", use_container_width=True,
                       type="primary" if active == key else "secondary"):
@@ -1731,8 +1738,10 @@ def _go_file(folder, meta, edit=False, src="home"):
     st.rerun()
 
 
-def _sidebar(uid):
-    with st.sidebar:
+def _account_footer(uid):
+    """Connected / Logout / Exit ALL - tiny expander at the very bottom (no sidebar)."""
+    st.write("")
+    with st.expander("⚙️ Account"):
         st.write(f"Connected: **{st.session_state.get('client_id', '-')}**")
         _reg = _engine_registry()
         with _reg["lock"]:
@@ -1740,32 +1749,29 @@ def _sidebar(uid):
         if n_running:
             st.caption(f"{n_running} strategy RUNNING - Logout / browser close pannaalum background-la odum. "
                        "Nirutha file-oda **Stop** click pannunga.")
-        if st.button("Logout (strategies keep running)"):
-            # Only this browser logs out. Engines are NOT stopped and keep their Angel login in server memory
-            # (they need it for the daily re-login). Re-login with the API key -> same running strategies.
+        if st.button("Logout (strategies keep running)", key="acct_logout"):
+            # Only this browser logs out. Engines are NOT stopped and keep their Angel login in server memory.
             mark_logged_out(uid, True)
             clear_login(uid)                     # next visit must enter API key again
             for k in ("smart", "client_id", "creds", "active_strategy"):
                 st.session_state.pop(k, None)
             st.session_state["no_autologin"] = True
-            # do NOT clear access_granted / access_email
             st.rerun()
-        with st.expander("Exit ALL"):
-            gen = st.session_state.get("exit_gen", 0)
-            st.caption("Ellaa strategies-oda ellaa open positions-ayum last price-la close panni, ellaa strategies-ayum stop pannum.")
-            exit_ok = st.checkbox("Confirm", key=f"exit_all_ok_{gen}")
-            if st.button("Exit ALL", type="primary", use_container_width=True,
-                         disabled=not exit_ok, key=f"exit_all_btn_{gen}"):
-                closed_n = stopped_n = 0
-                for fl in list_strategies(uid).values():
-                    for m in fl:
-                        eng = get_strategy_engine(uid, m["path"])
-                        was_running = eng.running
-                        closed_n += eng.exit_all("Manual exit (Exit ALL)")
-                        stopped_n += 1 if was_running else 0
-                st.session_state["flash"] = f"Exit ALL: {closed_n} position(s) closed, {stopped_n} strategy stopped."
-                st.session_state["exit_gen"] = gen + 1        # new, un-ticked Confirm box
-                st.rerun()
+        st.markdown("**Exit ALL**")
+        gen = st.session_state.get("exit_gen", 0)
+        st.caption("Ellaa strategies-oda ellaa open positions-ayum last price-la close panni, ellaa strategies-ayum stop pannum.")
+        exit_ok = st.checkbox("Confirm", key=f"exit_all_ok_{gen}")
+        if st.button("Exit ALL", type="primary", disabled=not exit_ok, key=f"exit_all_btn_{gen}"):
+            closed_n = stopped_n = 0
+            for fl in list_strategies(uid).values():
+                for m in fl:
+                    eng = get_strategy_engine(uid, m["path"])
+                    was_running = eng.running
+                    closed_n += eng.exit_all("Manual exit (Exit ALL)")
+                    stopped_n += 1 if was_running else 0
+            st.session_state["flash"] = f"Exit ALL: {closed_n} position(s) closed, {stopped_n} strategy stopped."
+            st.session_state["exit_gen"] = gen + 1        # new, un-ticked Confirm box
+            st.rerun()
 
 
 def strategy_page():
@@ -1773,7 +1779,6 @@ def strategy_page():
     uid = current_uid()
     no_dim()
     top_nav("home")
-    _sidebar(uid)
     st.title("Strategy")
     st.caption("Folder create pannunga -> folder-ah open panni (dropdown) files paarunga. File-ku Edit = pen icon.")
     frag = getattr(st, "fragment", None) or st.experimental_fragment
@@ -1860,7 +1865,6 @@ def paper_page():
     uid = current_uid()
     no_dim()
     top_nav("paper")
-    _sidebar(uid)
     st.title("Paper Trading")
     frag = getattr(st, "fragment", None) or st.experimental_fragment
 
@@ -2298,12 +2302,14 @@ def main_router():
         file_dashboard()
     elif page == "paper":
         paper_page()
+        _account_footer(current_uid())
     else:
         strategy_page()
+        _account_footer(current_uid())
 
 
 # ============================== ENTRY ==============================
-st.set_page_config(page_title="Live Paper Trading", layout="wide")
+st.set_page_config(page_title="Live Paper Trading", layout="wide", initial_sidebar_state="collapsed")
 
 if not access_gate():
     st.stop()
