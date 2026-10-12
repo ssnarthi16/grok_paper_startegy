@@ -1716,8 +1716,8 @@ def top_nav(active):
         </style>""",
         unsafe_allow_html=True,
     )
-    cols = st.columns([1.4, 1.8, 4])
-    for col, (key, label) in zip(cols[:2], (("home", "📁 Strategy"), ("paper", "📈 Paper Trading"))):
+    cols = st.columns([1.8, 1.8, 3.4])
+    for col, (key, label) in zip(cols[:2], (("home", "📁 My Strategies"), ("paper", "📈 Paper Trading"))):
         if col.button(label, key=f"nav_{key}", use_container_width=True,
                       type="primary" if active == key else "secondary"):
             st.session_state.pop("edit_open", None)
@@ -1775,68 +1775,98 @@ def _account_footer(uid):
 
 
 def strategy_page():
-    """STRATEGY tab: create folders -> open a folder (dropdown) -> files with P&L + edit pen."""
+    """MY STRATEGIES tab: create folders, see every folder -> its files (stored here)."""
     uid = current_uid()
     no_dim()
     top_nav("home")
-    st.title("Strategy")
-    st.caption("Folder create pannunga -> folder dropdown-la \"＋ New file\" -> files. File-ku Edit = pen icon. Run aagura files Paper Trading tab-la varum.")
+    st.title("My Strategies")
     frag = getattr(st, "fragment", None) or st.experimental_fragment
 
     flash = st.session_state.pop("flash", None)
     if flash:
         st.success(flash)
 
-    # ----- create folder -----
-    with st.form("new_folder_form", clear_on_submit=True):
-        f1, f2 = st.columns([4, 1])
-        fname = f1.text_input("Folder name", placeholder="New folder name (e.g. Pattern Scalping)",
-                              label_visibility="collapsed")
-        make = f2.form_submit_button("＋ Create folder", type="primary", use_container_width=True)
+    # ----- search + create folder (like the reference) -----
+    s1, s2 = st.columns([3, 4])
+    with s1:
+        q = st.text_input("Search", placeholder="🔍 Search folder / strategy...", key="ms_search",
+                          label_visibility="collapsed").strip().lower()
+    with s2:
+        with st.form("new_folder_form", clear_on_submit=True):
+            f1, f2 = st.columns([3, 1.2])
+            fname = f1.text_input("Folder name", placeholder="Enter new folder name",
+                                  label_visibility="collapsed")
+            make = f2.form_submit_button("📁＋ Create", type="primary", use_container_width=True)
     if make:
         if not fname or not fname.strip():
             st.error("Folder name enter pannunga.")
         else:
             safe = create_folder(uid, fname)
-            st.session_state["flash"] = f"Folder '{safe}' created. Folder dropdown-ah open panni '＋ New file' click pannunga."
+            st.session_state["flash"] = (f"Folder '{safe}' created. File create panna Paper Trading tab-ku "
+                                         "ponga (Folder Name-la indha folder select pannunga).")
             st.rerun()
 
     strategies = list_strategies(uid)
     if not strategies:
-        st.info("Folder illa. Mela folder name type panni **＋ Create folder** click pannunga.")
+        st.info("Folder illa. Mela folder name type panni **Create** click pannunga.")
         return
 
-    # ----- folders (dropdown) -----
+    shown = {}
     for folder, files in strategies.items():
-        f_paths = [m["path"] for m in files]
-        f_cap = _folder_cap(files)
-        f_run = 2 if any(m.get("running") for m in files) else None
+        if not q or q in folder.lower():
+            shown[folder] = files
+        else:
+            hit = [m for m in files if q in m["file"].lower()]
+            if hit:
+                shown[folder] = hit
+    if not shown:
+        st.info("Search-ku match aagura folder / strategy illa.")
+        return
+
+    for folder, files in shown.items():
+        all_files = strategies[folder]
+        f_paths = [m["path"] for m in all_files]
+        f_cap = _folder_cap(all_files)
+        n_run = sum(1 for m in all_files if m.get("running"))
+        f_run = 2 if n_run else None
         h_left, h_right = st.columns([5, 2.6])
         with h_right:
-            if files:
+            if all_files:
                 frag(run_every=f_run)(_pnl_inline)(uid, f_paths, f_cap)
         with h_left:
-            with st.expander(f"📁 {folder}  ·  {len(files)} file(s)"):
+            with st.expander(f"📁 {folder}   ·   Live {n_run}   ·   Total {len(all_files)}", expanded=bool(q)):
                 if not files:
-                    st.caption("Indha folder-la file illa.")
+                    st.caption("Indha folder-la file illa. Paper Trading tab-la file create pannunga.")
+                else:
+                    w = [2.4, 2.0, 1.2, 3.0, 0.55, 0.55]
+                    hc = st.columns(w)
+                    for col, label in zip(hc[:4], ("Name & details", "Instruments", "Status", "P&L")):
+                        col.caption(f"**{label}**")
+                    hc[4].caption("**Edit**")
+                    hc[5].caption("**Del**")
                 for meta in files:
                     running = meta.get("running", False)
-                    badge = "🟢 RUNNING" if running else "⚪ STOPPED"
                     has_open = strategy_pnl(uid, meta["path"])["open"] > 0
                     capital = meta.get("capital", "-")
-                    r1, r2, r3, r4 = st.columns([2.4, 3.2, 0.6, 0.6])
-                    with r1:
+                    syms = [i.get("symbol", "") for i in meta.get("items", [])]
+                    inst = ", ".join(syms[:3]) + (f" +{len(syms) - 3}" if len(syms) > 3 else "")
+                    r = st.columns([2.4, 2.0, 1.2, 3.0, 0.55, 0.55])
+                    with r[0]:
                         # click file name = open the file ( type="tertiary" needs Streamlit 1.46+ )
                         if st.button(f"📄 {meta['file']}", key=f"sopen_{folder}_{meta['file']}",
                                      type="tertiary", help="Click pannaa file open aagum"):
                             _go_file(folder, meta, False, "home")
-                        st.caption(f"{badge} · {meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
-                    with r2:
+                        st.caption(f"{meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
+                    with r[1]:
+                        st.caption(inst or "-")
+                    with r[2]:
+                        st.caption("🟢 Running" if running else "⚪ Stopped")
+                    with r[3]:
                         frag(run_every=2 if running else None)(_pnl_inline)(uid, [meta["path"]], capital)
-                    with r3:
+                    with r[4]:
                         if st.button("✏️", key=f"sedit_{folder}_{meta['file']}", help="Edit settings"):
                             _go_file(folder, meta, True, "home")
-                    with r4:
+                    with r[5]:
                         if st.button("🗑", key=f"sdel_{folder}_{meta['file']}", help="Delete file"):
                             if running:
                                 st.warning("Stop first, then delete.")
@@ -1845,21 +1875,149 @@ def strategy_page():
                             else:
                                 delete_strategy(uid, folder, meta["file"])
                                 st.rerun()
-                if st.button("＋ New file", key=f"newfile_{folder}", type="primary"):
-                    for k in ("create_step", "create_folder", "create_file"):
-                        st.session_state.pop(k, None)
-                    st.session_state["create_pre_folder"] = folder
-                    st.session_state["nav_from"] = "home"
-                    _set_nav("create")
-                    st.rerun()
-                if not files and st.button("Delete folder", key=f"delfolder_{folder}"):
+                if not all_files and st.button("Delete folder", key=f"delfolder_{folder}"):
                     import shutil
                     shutil.rmtree(os.path.join(user_strategies_root(uid), folder), ignore_errors=True)
                     st.rerun()
 
 
+def _paper_form(uid):
+    """Folder Name + File Name + Exchange / Stocks / Capital ... + Start / Stop (all on this page)."""
+    gen = st.session_state.get("pt_gen", 0)
+    smart = st.session_state.get("smart")
+    NEWF = "＋ New folder..."
+    folders = list(list_strategies(uid).keys())
+    opts = folders + [NEWF]
+    if st.session_state.get("pt_folder") not in opts:
+        st.session_state.pop("pt_folder", None)
+
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        pick = c1.selectbox("Folder Name", opts, key="pt_folder")
+        new_folder = ""
+        if pick == NEWF:
+            new_folder = c1.text_input("New folder name", key=f"pt_newfolder_{gen}", placeholder="e.g. Pattern Scalping")
+        file_name = c2.text_input("File Name", key=f"pt_file_{gen}", placeholder="e.g. NSE morning")
+        folder = (new_folder if pick == NEWF else pick) or ""
+
+        try:
+            master = load_master()
+        except Exception as ex:
+            master = None
+            st.warning(f"Stock list load aagala ({ex}).")
+
+        e1, e2, e3 = st.columns(3)
+        exchange = e1.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"], key="pt_exchange")
+        capital = e2.number_input("Capital", min_value=10000.0, value=None, step=10000.0, placeholder="Capital")
+        tf_label = e3.selectbox("Candle timeframe", list(TIMEFRAMES), index=None, placeholder="Select timeframe")
+
+        items = []
+        if master is not None:
+            inst = exchange_list_cached(exchange)
+            labels = inst["label"].tolist()
+            by_label = inst.set_index("label")
+            pick_all = st.checkbox(f"Select all {len(labels)}", key=f"pt_all_{exchange}")
+            picked = labels if pick_all else st.multiselect(
+                f"{exchange} stocks ({len(labels)})", labels, key=f"pt_stocks_{exchange}",
+            )
+            typed = st.text_input("Or type names (comma separated)", key="pt_typed")
+            names, miss = list(picked), []
+            for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
+                hit = inst[(inst["label"].str.upper() == t) | (inst["symbol"].str.upper() == t)
+                           | (inst["name"].str.upper() == t)]
+                if hit.empty:
+                    miss.append(t)
+                elif hit.iloc[0]["label"] not in names:
+                    names.append(hit.iloc[0]["label"])
+            if miss:
+                st.warning("Not found in " + exchange + ": " + ", ".join(miss))
+            items = [to_item({**by_label.loc[n].to_dict(), "label": n}, exchange) for n in names]
+        else:
+            typed = st.text_input("Type names (comma separated)", key="pt_typed2")
+            miss = []
+            for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
+                it = search_item(smart, exchange, t) if smart else None
+                if it:
+                    items.append(it)
+                else:
+                    miss.append(t)
+            if miss:
+                st.warning("Not found: " + ", ".join(miss))
+        if len(items) > 50:
+            st.caption("Angel API limit — first 50 stocks only.")
+
+        NO_LIMIT = "Select max (no limit)"
+        m1, m2, m3 = st.columns(3)
+        max_pick = m1.selectbox("Max open positions", [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50], index=0)
+        no_limit = max_pick == NO_LIMIT
+        if no_limit:
+            max_open = 10 ** 6
+            position_amount = m2.number_input("Amount per position", min_value=1.0, value=None,
+                                              step=1000.0, placeholder="Amount")
+        else:
+            max_open = int(max_pick)
+            position_amount = m2.number_input(
+                "Amount per position", min_value=1.0,
+                value=float(round(capital / max_open, 2)) if capital else None,
+                step=1000.0, placeholder="Amount",
+            )
+        target_pct = m3.number_input("Target (%)", min_value=0.1, max_value=20.0, value=None,
+                                     step=0.1, placeholder="Target %")
+
+        # is this folder/file already there / running?
+        path = strategy_dir(uid, folder, file_name) if folder.strip() and file_name.strip() else None
+        eng = _get_engine_by_path(uid, path) if path else None
+        is_running = bool(eng and eng.running)
+        exists = bool(path and os.path.exists(os.path.join(path, "config.json")))
+        if exists and not is_running:
+            st.caption("Indha folder / file already irukku - Start pannina settings overwrite aagum.")
+        if is_running:
+            st.caption("Indha file already RUNNING. Maatha mela irukkura Running list-la ✏️ use pannunga.")
+
+        b1, b2, _sp = st.columns([1, 1, 4])
+        start = b1.button("▶ Start", type="primary", use_container_width=True, disabled=is_running, key=f"pt_start_{gen}")
+        stop = b2.button("⏹ Stop", use_container_width=True, disabled=not is_running, key=f"pt_stop_{gen}")
+
+    if stop and eng:
+        eng.stop()
+        st.session_state["flash"] = f"{folder} / {file_name}: stopped."
+        st.rerun()
+
+    if start:
+        missing = [n for n, v in (("Folder Name", folder.strip()), ("File Name", file_name.strip()),
+                                  ("Capital", capital), ("Candle timeframe", tf_label),
+                                  ("Amount per position", position_amount), ("Target %", target_pct)) if not v]
+        if missing:
+            st.error("Fill: " + ", ".join(missing))
+        elif not items:
+            st.error("Stocks select pannunga.")
+        elif smart is None:
+            st.error("Angel One login illa.")
+        else:
+            interval, tf_min = TIMEFRAMES[tf_label]
+            data = {
+                "exchange": exchange, "items": items, "capital": float(capital),
+                "tf_label": tf_label, "interval": interval, "tf_min": tf_min,
+                "max_open": int(max_open), "no_limit": no_limit,
+                "position_amount": float(position_amount), "target_pct": float(target_pct),
+            }
+            create_folder(uid, folder)
+            spath = save_strategy_config(uid, folder, file_name, data)
+            engine = get_strategy_engine(uid, spath)
+            if engine.smart is None:
+                engine.set_login(smart, st.session_state.get("creds"), st.session_state.get("client_id", ""))
+            cfg = Config(capital=float(capital), max_open=int(max_open), target_pct=float(target_pct),
+                         interval=interval, tf_min=int(tf_min), position_amount=float(position_amount),
+                         no_limit=bool(no_limit))
+            engine.start(engine.smart or smart, cfg, items, exchange, False)
+            st.session_state["pt_gen"] = gen + 1            # fresh Folder-new / File name boxes
+            st.session_state.pop("pt_folder", None)
+            st.session_state["flash"] = f"{_safe_name(folder)} / {_safe_name(file_name)} saved + STARTED."
+            st.rerun()
+
+
 def paper_page():
-    """PAPER TRADING tab: create file + only the RUNNING strategies (no folders shown)."""
+    """PAPER TRADING tab: create (Folder, File, Exchange, Stocks, Capital...) + Start / Stop + Running list."""
     uid = current_uid()
     no_dim()
     top_nav("paper")
@@ -1876,27 +2034,34 @@ def paper_page():
     if all_files:
         frag(run_every=any_run)(_overall_panel)(uid)
 
+    _paper_form(uid)
+
     running_files = [(m["folder"], m) for m in all_files if m.get("running")]
     st.subheader(f"Running ({len(running_files)})")
     if not running_files:
-        st.info("Ippo edhuvum run aagala. **Strategy** tab-la folder dropdown-la file name click panni Start pannunga.")
+        st.info("Ippo edhuvum run aagala. Mela file create panni **▶ Start** click pannunga.")
         return
 
     for folder, meta in running_files:
-        has_open = strategy_pnl(uid, meta["path"])["open"] > 0
         capital = meta.get("capital", "-")
         with st.container(border=True):
-            p1, p2, p3e, p3 = st.columns([2.6, 3.4, 0.6, 1])
+            p1, p2, p3e, p3s, p3 = st.columns([2.4, 3.2, 0.6, 1, 1])
             with p1:
                 if st.button(f"📄 {meta['file']}", key=f"popen_{folder}_{meta['file']}",
-                             type="tertiary", help="Open live page (Start / Stop / tables)"):
+                             type="tertiary", help="Open live page (tables)"):
                     _go_file(folder, meta, False, "paper")
-                st.caption(f"🟢 RUNNING · {meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
+                st.caption(f"📁 {folder} · 🟢 RUNNING · {meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
             with p2:
                 frag(run_every=2)(_pnl_inline)(uid, [meta["path"]], capital)
             with p3e:
                 if st.button("✏️", key=f"pedit_{folder}_{meta['file']}", help="Edit settings"):
                     _go_file(folder, meta, True, "paper")
+            with p3s:
+                if st.button("⏹ Stop", key=f"pstop_{folder}_{meta['file']}", use_container_width=True,
+                             help="Strategy stop (open positions appadiye irukkum)"):
+                    get_strategy_engine(uid, meta["path"]).stop()
+                    st.session_state["flash"] = f"{folder} / {meta['file']}: stopped."
+                    st.rerun()
             with p3:
                 if st.button("Exit", key=f"pexit_{folder}_{meta['file']}", use_container_width=True,
                              help="Ellaa open positions-ayum last price-la close panni, strategy-ah stop pannum"):
@@ -1904,155 +2069,6 @@ def paper_page():
                     st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
                                                  "strategy stopped.")
                     st.rerun()
-
-
-def create_strategy_page():
-    """Step 1: folder + file name. Step 2: settings. Then open file page."""
-    uid = current_uid()
-    no_dim()
-    step = st.session_state.get("create_step", 1)
-    top_nav("home")
-
-    if st.button("← Back to Strategy"):
-        _set_nav("home")
-        st.rerun()
-
-    st.title("New strategy / file")
-
-    if step == 1:
-        st.subheader("Step 1 · File name")
-        existing = list(list_strategies(uid).keys())
-        if not existing:
-            st.info("Mudhalla **Strategy** tab-la oru folder create pannunga.")
-            return
-        pre = st.session_state.get("create_pre_folder")
-        folder = st.selectbox("Folder", existing, index=existing.index(pre) if pre in existing else 0)
-        file_name = st.text_input("File name", placeholder="e.g. NSE morning")
-        if st.button("Next", type="primary"):
-            if not file_name or not file_name.strip():
-                st.error("File name enter pannunga.")
-            else:
-                path = strategy_dir(uid, folder, file_name)
-                if os.path.exists(os.path.join(path, "config.json")):
-                    st.error("This folder/file already exists. Choose another name.")
-                else:
-                    st.session_state["create_folder"] = folder.strip()
-                    st.session_state["create_file"] = file_name.strip()
-                    st.session_state["create_step"] = 2
-                    st.rerun()
-        return
-
-    # Step 2
-    folder = st.session_state.get("create_folder", "")
-    file_name = st.session_state.get("create_file", "")
-    st.subheader(f"Step 2 · Settings  ·  {folder} / {file_name}")
-    if st.button("← Back to Step 1"):
-        st.session_state["create_step"] = 1
-        st.rerun()
-
-    smart = st.session_state.smart
-    try:
-        master = load_master()
-    except Exception as ex:
-        master = None
-        st.warning(f"Stock list load aagala ({ex}).")
-
-    exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"])
-    items = []
-    if master is not None:
-        inst = exchange_list_cached(exchange)
-        labels = inst["label"].tolist()
-        by_label = inst.set_index("label")
-        pick_all = st.checkbox(f"Select all {len(labels)}", key=f"create_all_{exchange}")
-        picked = labels if pick_all else st.multiselect(
-            f"{exchange} stocks ({len(labels)})", labels, key=f"create_stocks_{exchange}",
-        )
-        typed = st.text_input("Or type names (comma separated)", key="create_typed")
-        names, miss = list(picked), []
-        for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
-            hit = inst[
-                (inst["label"].str.upper() == t)
-                | (inst["symbol"].str.upper() == t)
-                | (inst["name"].str.upper() == t)
-            ]
-            if hit.empty:
-                miss.append(t)
-            elif hit.iloc[0]["label"] not in names:
-                names.append(hit.iloc[0]["label"])
-        if miss:
-            st.warning("Not found in " + exchange + ": " + ", ".join(miss))
-        items = [to_item({**by_label.loc[n].to_dict(), "label": n}, exchange) for n in names]
-    else:
-        typed = st.text_input("Type names (comma separated)", key="create_typed2")
-        miss = []
-        for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
-            it = search_item(smart, exchange, t)
-            if it:
-                items.append(it)
-            else:
-                miss.append(t)
-        if miss:
-            st.warning("Not found: " + ", ".join(miss))
-
-    if len(items) > 50:
-        st.caption("Angel API limit — first 50 stocks only.")
-
-    capital = st.number_input("Capital", min_value=10000.0, value=None, step=10000.0, placeholder="Capital")
-    tf_label = st.selectbox("Candle timeframe", list(TIMEFRAMES), index=None, placeholder="Select timeframe")
-    NO_LIMIT = "Select max (no limit)"
-    max_pick = st.selectbox("Max open positions", [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50], index=0)
-    no_limit = max_pick == NO_LIMIT
-    if no_limit:
-        max_open = 10 ** 6
-        position_amount = st.number_input(
-            "Amount per position", min_value=1.0, value=None, step=1000.0, placeholder="Amount",
-        )
-    else:
-        max_open = int(max_pick)
-        position_amount = st.number_input(
-            "Amount per position",
-            min_value=1.0,
-            value=float(round(capital / max_open, 2)) if capital else None,
-            step=1000.0, placeholder="Amount",
-        )
-    target_pct = st.number_input("Target (%)", min_value=0.1, max_value=20.0, value=None, step=0.1, placeholder="Target %")
-
-    if st.button("Save", type="primary"):
-        missing = [
-            n for n, v in (
-                ("Capital", capital), ("Candle timeframe", tf_label),
-                ("Amount per position", position_amount), ("Target %", target_pct),
-            ) if not v
-        ]
-        if missing:
-            st.error("Fill: " + ", ".join(missing))
-        elif not items:
-            st.error("Stocks select pannunga.")
-        else:
-            interval, tf_min = TIMEFRAMES[tf_label]
-            data = {
-                "exchange": exchange,
-                "items": items,
-                "capital": float(capital),
-                "tf_label": tf_label,
-                "interval": interval,
-                "tf_min": tf_min,
-                "max_open": int(max_open),
-                "no_limit": no_limit,
-                "position_amount": float(position_amount),
-                "target_pct": float(target_pct),
-            }
-            path = save_strategy_config(uid, folder, file_name, data)
-            sf, sn = _safe_name(folder), _safe_name(file_name)
-            st.session_state["active_strategy"] = {
-                "folder": sf, "file": sn, "path": path,
-            }
-            for k in ("create_step", "create_folder", "create_file"):
-                st.session_state.pop(k, None)
-            st.session_state["nav_from"] = "home"
-            _set_nav("file", sf, sn)
-            st.success("Saved.")
-            st.rerun()
 
 
 def file_dashboard():
@@ -2094,7 +2110,7 @@ def file_dashboard():
     no_dim()
     _from = st.session_state.get("nav_from", "home")
     top_nav(_from)
-    if st.button("← Back to " + ("Paper Trading" if _from == "paper" else "Strategy")):
+    if st.button("← Back to " + ("Paper Trading" if _from == "paper" else "My Strategies")):
         st.session_state.pop("edit_open", None)
         st.session_state.pop("active_strategy", None)
         _set_nav(_from)
@@ -2288,9 +2304,7 @@ def file_dashboard():
 def main_router():
     """After login: Strategy tab / Paper Trading tab / create file / file page."""
     page = st.session_state.get("page") or str(st.query_params.get("p", "home"))
-    if page == "create":
-        create_strategy_page()
-    elif page == "file":
+    if page == "file":
         file_dashboard()
     elif page == "paper":
         paper_page()
