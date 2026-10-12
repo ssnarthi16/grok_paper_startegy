@@ -1624,7 +1624,7 @@ def _set_nav(page="home", folder="", file=""):
     if st.session_state.get("access_email"):
         qp["e"] = st.session_state["access_email"]
     qp["p"] = page
-    if page == "file" and folder and file:
+    if page in ("file", "paper") and folder and file:
         qp["folder"] = folder
         qp["file"] = file
     else:
@@ -1721,6 +1721,8 @@ def top_nav(active):
         if col.button(label, key=f"nav_{key}", use_container_width=True,
                       type="primary" if active == key else "secondary"):
             st.session_state.pop("edit_open", None)
+            if key == "paper":
+                st.session_state.pop("paper_active", None)       # back to the empty setup form
             st.session_state["nav_from"] = key
             _set_nav(key)
             st.rerun()
@@ -1829,56 +1831,79 @@ def strategy_page():
         f_cap = _folder_cap(all_files)
         n_run = sum(1 for m in all_files if m.get("running"))
         f_run = 2 if n_run else None
-        h_left, h_right = st.columns([5, 2.6])
-        with h_right:
+        f_has_open = any(strategy_pnl(uid, pth)["open"] > 0 for pth in f_paths)
+
+        with st.expander(f"📁 {folder}   ·   Live {n_run}   ·   Total {len(all_files)}", expanded=bool(q)):
+            # ----- folder P&L (tracked inside the folder) + Exit whole folder -----
             if all_files:
-                frag(run_every=f_run)(_pnl_inline)(uid, f_paths, f_cap)
-        with h_left:
-            with st.expander(f"📁 {folder}   ·   Live {n_run}   ·   Total {len(all_files)}", expanded=bool(q)):
-                if not files:
-                    st.caption("Indha folder-la file illa. Paper Trading tab-la file create pannunga.")
-                else:
-                    w = [2.4, 2.0, 1.2, 3.0, 0.55, 0.55]
-                    hc = st.columns(w)
-                    for col, label in zip(hc[:4], ("Name & details", "Instruments", "Status", "P&L")):
-                        col.caption(f"**{label}**")
-                    hc[4].caption("**Edit**")
-                    hc[5].caption("**Del**")
-                for meta in files:
-                    running = meta.get("running", False)
-                    has_open = strategy_pnl(uid, meta["path"])["open"] > 0
-                    capital = meta.get("capital", "-")
-                    syms = [i.get("symbol", "") for i in meta.get("items", [])]
-                    inst = ", ".join(syms[:3]) + (f" +{len(syms) - 3}" if len(syms) > 3 else "")
-                    r = st.columns([2.4, 2.0, 1.2, 3.0, 0.55, 0.55])
-                    with r[0]:
-                        # click file name = open the file ( type="tertiary" needs Streamlit 1.46+ )
-                        if st.button(f"📄 {meta['file']}", key=f"sopen_{folder}_{meta['file']}",
-                                     type="tertiary", help="Click pannaa file open aagum"):
-                            _go_file(folder, meta, False, "home")
-                        st.caption(f"{meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
-                    with r[1]:
-                        st.caption(inst or "-")
-                    with r[2]:
-                        st.caption("🟢 Running" if running else "⚪ Stopped")
-                    with r[3]:
-                        frag(run_every=2 if running else None)(_pnl_inline)(uid, [meta["path"]], capital)
-                    with r[4]:
-                        if st.button("✏️", key=f"sedit_{folder}_{meta['file']}", help="Edit settings"):
-                            _go_file(folder, meta, True, "home")
-                    with r[5]:
-                        if st.button("🗑", key=f"sdel_{folder}_{meta['file']}", help="Delete file"):
-                            if running:
-                                st.warning("Stop first, then delete.")
-                            elif has_open:
-                                st.warning("Open positions irukku - Exit pannittu delete pannunga.")
-                            else:
-                                delete_strategy(uid, folder, meta["file"])
-                                st.rerun()
-                if not all_files and st.button("Delete folder", key=f"delfolder_{folder}"):
-                    import shutil
-                    shutil.rmtree(os.path.join(user_strategies_root(uid), folder), ignore_errors=True)
-                    st.rerun()
+                fa, fb = st.columns([5, 1.4])
+                with fa:
+                    st.caption("**Folder P&L**")
+                    frag(run_every=f_run)(_pnl_inline)(uid, f_paths, f_cap)
+                with fb:
+                    if st.button("Exit folder", key=f"exitfolder_{folder}", use_container_width=True,
+                                 disabled=not (n_run or f_has_open),
+                                 help="Indha folder-la ulla ellaa files-oda open positions-ayum close panni, ellaa files-ayum stop pannum"):
+                        closed_n = 0
+                        for m in all_files:
+                            closed_n += get_strategy_engine(uid, m["path"]).exit_all("Manual exit (Exit folder)")
+                        st.session_state["flash"] = f"{folder}: {closed_n} position(s) closed, all files stopped."
+                        st.rerun()
+                st.divider()
+            else:
+                st.caption("Indha folder-la file illa. Paper Trading tab-la file create pannunga.")
+
+            # ----- files table -----
+            if files:
+                w = [2.4, 2.0, 1.2, 3.2, 0.8, 0.9, 0.8]
+                hc = st.columns(w)
+                for col, label in zip(hc, ("Name & details", "Instruments", "Status", "P&L", "Edit", "Exit", "Del")):
+                    col.caption(f"**{label}**")
+            for meta in files:
+                running = meta.get("running", False)
+                has_open = strategy_pnl(uid, meta["path"])["open"] > 0
+                capital = meta.get("capital", "-")
+                syms = [i.get("symbol", "") for i in meta.get("items", [])]
+                inst = ", ".join(syms[:3]) + (f" +{len(syms) - 3}" if len(syms) > 3 else "")
+                r = st.columns([2.4, 2.0, 1.2, 3.2, 0.8, 0.9, 0.8])
+                with r[0]:
+                    # click file name = open the file ( type="tertiary" needs Streamlit 1.46+ )
+                    if st.button(f"📄 {meta['file']}", key=f"sopen_{folder}_{meta['file']}",
+                                 type="tertiary", help="Click pannaa file open aagum"):
+                        _go_file(folder, meta, False, "home")
+                    st.caption(f"{meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
+                with r[1]:
+                    st.caption(inst or "-")
+                with r[2]:
+                    st.caption("🟢 Running" if running else "⚪ Stopped")
+                with r[3]:
+                    frag(run_every=2 if running else None)(_pnl_inline)(uid, [meta["path"]], capital)
+                with r[4]:
+                    if st.button("✏️", key=f"sedit_{folder}_{meta['file']}", help="Edit settings",
+                                 use_container_width=True):
+                        _go_file(folder, meta, True, "home")
+                with r[5]:
+                    if st.button("Exit", key=f"sexit_{folder}_{meta['file']}", use_container_width=True,
+                                 disabled=not (running or has_open),
+                                 help="Indha file-oda ellaa open positions-ayum close panni, strategy-ah stop pannum"):
+                        n = get_strategy_engine(uid, meta["path"]).exit_all("Manual exit (Exit)")
+                        st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
+                                                     "strategy stopped.")
+                        st.rerun()
+                with r[6]:
+                    if st.button("🗑", key=f"sdel_{folder}_{meta['file']}", help="Delete file",
+                                 use_container_width=True):
+                        if running:
+                            st.warning("Stop first, then delete.")
+                        elif has_open:
+                            st.warning("Open positions irukku - Exit pannittu delete pannunga.")
+                        else:
+                            delete_strategy(uid, folder, meta["file"])
+                            st.rerun()
+            if not all_files and st.button("Delete folder", key=f"delfolder_{folder}"):
+                import shutil
+                shutil.rmtree(os.path.join(user_strategies_root(uid), folder), ignore_errors=True)
+                st.rerun()
 
 
 def _paper_form(uid):
@@ -1972,16 +1997,9 @@ def _paper_form(uid):
         if exists and not is_running:
             st.caption("Indha folder / file already irukku - Start pannina settings overwrite aagum.")
         if is_running:
-            st.caption("Indha file already RUNNING. Maatha mela irukkura Running list-la ✏️ use pannunga.")
+            st.caption("Indha file already RUNNING. My Strategies-la file name click panni paarunga.")
 
-        b1, b2, _sp = st.columns([1, 1, 4])
-        start = b1.button("▶ Start", type="primary", use_container_width=True, disabled=is_running, key=f"pt_start_{gen}")
-        stop = b2.button("⏹ Stop", use_container_width=True, disabled=not is_running, key=f"pt_stop_{gen}")
-
-    if stop and eng:
-        eng.stop()
-        st.session_state["flash"] = f"{folder} / {file_name}: stopped."
-        st.rerun()
+        start = st.button("▶ Start", type="primary", disabled=is_running, key=f"pt_start_{gen}")
 
     if start:
         missing = [n for n, v in (("Folder Name", folder.strip()), ("File Name", file_name.strip()),
@@ -2010,65 +2028,108 @@ def _paper_form(uid):
                          interval=interval, tf_min=int(tf_min), position_amount=float(position_amount),
                          no_limit=bool(no_limit))
             engine.start(engine.smart or smart, cfg, items, exchange, False)
-            st.session_state["pt_gen"] = gen + 1            # fresh Folder-new / File name boxes
+            sf, sn = _safe_name(folder), _safe_name(file_name)
+            st.session_state["pt_gen"] = gen + 1            # fresh boxes next time
             st.session_state.pop("pt_folder", None)
-            st.session_state["flash"] = f"{_safe_name(folder)} / {_safe_name(file_name)} saved + STARTED."
+            st.session_state["paper_active"] = {"folder": sf, "file": sn, "path": spath}
+            _set_nav("paper", sf, sn)
             st.rerun()
 
 
+def _run_view(uid, folder, file_name, path):
+    """After Start: only Start / Stop + the full live result of this file."""
+    cfg_data = load_strategy_config(path)
+    if not cfg_data:
+        st.error("Indha file-oda config kidaikkala.")
+        return
+    engine = get_strategy_engine(uid, path)
+    if st.session_state.get("smart") and engine.smart is None:
+        engine.set_login(st.session_state.smart, st.session_state.get("creds"),
+                         st.session_state.get("client_id", ""))
+    exchange = cfg_data.get("exchange", "NSE")
+    tf_label = cfg_data.get("tf_label", "-")
+
+    st.subheader(f"📁 {folder}  /  📄 {file_name}")
+    b1, b2, _sp = st.columns([1, 1, 4])
+    start = b1.button("▶ Start", type="primary", use_container_width=True,
+                      disabled=engine.running, key="run_start")
+    stop = b2.button("⏹ Stop", use_container_width=True, disabled=not engine.running, key="run_stop")
+    if stop:
+        engine.stop()
+        st.rerun()
+    if start:
+        smart = engine.smart or st.session_state.get("smart")
+        if smart is None:
+            st.error("Angel One login illa.")
+        elif not cfg_data.get("items"):
+            st.error("No stocks in this file.")
+        else:
+            cfg = Config(
+                capital=float(cfg_data.get("capital", 0)),
+                max_open=int(cfg_data.get("max_open", 5)),
+                target_pct=float(cfg_data.get("target_pct", 1.0)),
+                interval=cfg_data.get("interval", "FIVE_MINUTE"),
+                tf_min=int(cfg_data.get("tf_min", 5)),
+                position_amount=float(cfg_data.get("position_amount") or 0),
+                no_limit=bool(cfg_data.get("no_limit", False)),
+            )
+            engine.start(smart, cfg, cfg_data["items"], exchange, False)
+            st.rerun()
+
+    frag = getattr(st, "fragment", None) or st.experimental_fragment
+    fast = 1 if engine.running else None
+    slow = 3 if engine.running else None
+
+    @frag(run_every=fast)
+    def _top():
+        live_top(engine, exchange, tf_label)
+
+    @frag(run_every=slow)
+    def _mid():
+        live_mid(engine)
+
+    @frag(run_every=fast)
+    def _pos():
+        live_positions(engine)
+
+    @frag(run_every=slow)
+    def _bot():
+        live_bottom(engine)
+
+    _top()
+    _mid()
+    _pos()
+    _bot()
+
+
 def paper_page():
-    """PAPER TRADING tab: create (Folder, File, Exchange, Stocks, Capital...) + Start / Stop + Running list."""
+    """PAPER TRADING tab: setup form -> after Start the form disappears, only Start/Stop + live result."""
     uid = current_uid()
     no_dim()
     top_nav("paper")
     st.title("Paper Trading")
-    frag = getattr(st, "fragment", None) or st.experimental_fragment
 
     flash = st.session_state.pop("flash", None)
     if flash:
         st.success(flash)
 
-    strategies = list_strategies(uid)
-    all_files = [m for fl in strategies.values() for m in fl]
-    any_run = 2 if any(m.get("running") for m in all_files) else None
-    if all_files:
-        frag(run_every=any_run)(_overall_panel)(uid)
+    active = st.session_state.get("paper_active")
+    if not active:                       # refresh keeps you on the same running file (URL)
+        qf = str(st.query_params.get("folder", "")).strip()
+        qn = str(st.query_params.get("file", "")).strip()
+        if qf and qn:
+            pth = strategy_dir(uid, qf, qn)
+            if os.path.exists(os.path.join(pth, "config.json")):
+                active = {"folder": _safe_name(qf), "file": _safe_name(qn), "path": pth}
+                st.session_state["paper_active"] = active
+    if active and not os.path.exists(os.path.join(active["path"], "config.json")):
+        st.session_state.pop("paper_active", None)       # file was deleted
+        active = None
 
-    _paper_form(uid)
-
-    running_files = [(m["folder"], m) for m in all_files if m.get("running")]
-    st.subheader(f"Running ({len(running_files)})")
-    if not running_files:
-        st.info("Ippo edhuvum run aagala. Mela file create panni **▶ Start** click pannunga.")
-        return
-
-    for folder, meta in running_files:
-        capital = meta.get("capital", "-")
-        with st.container(border=True):
-            p1, p2, p3e, p3s, p3 = st.columns([2.4, 3.2, 0.6, 1, 1])
-            with p1:
-                if st.button(f"📄 {meta['file']}", key=f"popen_{folder}_{meta['file']}",
-                             type="tertiary", help="Open live page (tables)"):
-                    _go_file(folder, meta, False, "paper")
-                st.caption(f"📁 {folder} · 🟢 RUNNING · {meta.get('exchange', '-')} · {meta.get('tf_label', '-')} · capital {capital}")
-            with p2:
-                frag(run_every=2)(_pnl_inline)(uid, [meta["path"]], capital)
-            with p3e:
-                if st.button("✏️", key=f"pedit_{folder}_{meta['file']}", help="Edit settings"):
-                    _go_file(folder, meta, True, "paper")
-            with p3s:
-                if st.button("⏹ Stop", key=f"pstop_{folder}_{meta['file']}", use_container_width=True,
-                             help="Strategy stop (open positions appadiye irukkum)"):
-                    get_strategy_engine(uid, meta["path"]).stop()
-                    st.session_state["flash"] = f"{folder} / {meta['file']}: stopped."
-                    st.rerun()
-            with p3:
-                if st.button("Exit", key=f"pexit_{folder}_{meta['file']}", use_container_width=True,
-                             help="Ellaa open positions-ayum last price-la close panni, strategy-ah stop pannum"):
-                    n = get_strategy_engine(uid, meta["path"]).exit_all("Manual exit (Exit)")
-                    st.session_state["flash"] = (f"{folder} / {meta['file']}: {n} position(s) closed, "
-                                                 "strategy stopped.")
-                    st.rerun()
+    if active:
+        _run_view(uid, active["folder"], active["file"], active["path"])
+    else:
+        _paper_form(uid)
 
 
 def file_dashboard():
